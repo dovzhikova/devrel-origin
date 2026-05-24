@@ -22,6 +22,7 @@ Atlas (Orchestrator)
 ├── Health Pipeline
 │   ├── Watchdog → System Health (pre-flight checks, budget, integration status)
 │   ├── Sentinel → Brand Auditor (pre-publish voice, ICP, messaging audit)
+│   ├── Cyra     → CRO Auditor (opt-in landing-page conversion audit; Stage 5c)
 │   └── Argus    → Content Performance Analyst (post-publish: PostHog, GitHub,
 │                  Instantly, Echo's social_mentions — structured Recommendations)
 │

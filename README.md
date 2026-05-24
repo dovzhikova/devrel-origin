@@ -171,7 +171,7 @@ Hub-and-spoke with 15 agents. Atlas orchestrates; specialists execute across the
 
 ```
 Atlas (Orchestrator)
-├── Health: Watchdog (pre-flight) + Sentinel (pre-publish brand audit) + Argus (post-publish performance analyst)
+├── Health: Watchdog (pre-flight) + Sentinel (pre-publish brand audit) + Cyra (CRO audit, opt-in) + Argus (post-publish performance analyst)
 ├── DevRel: Sage, Echo, Iris, Nova, Kai, Vox, Dex
 └── Sales:  Rex, Pax, Mox
 ```
@@ -186,10 +186,11 @@ Stage 3: Nova + Kai            parallel (Kai routes through quality pipeline)
 Stage 4: Vox
 Stage 5: Sentinel              brand audit
 Stage 5b: Argus                post-publish content performance analysis
+Stage 5c: Cyra                 CRO audit (opt-in via [orchestration].cro_in_run)
 Stage 6: Instantly sync, OKR compilation, Sheets publish, digest
 ```
 
-Argus is config-gated by `[orchestration].analytics_in_run` (default `true`); set to `false` to skip the stage. Standalone use via `devrel analytics report` is unaffected.
+Argus is config-gated by `[orchestration].analytics_in_run` (default `true`); set to `false` to skip the stage. Standalone use via `devrel analytics report` is unaffected. Cyra is opt-in via `[orchestration].cro_in_run` (default `false`); standalone use via `devrel cro audit` is unaffected.
 
 The `Atlas.delegate()` API also dispatches single-agent tasks, which is what every non-`run` verb wraps. So `devrel triage` is `Atlas.delegate("sage", "Triage GitHub issues from the last 7 days")` — the agents never appear in the public CLI surface, only the verbs.
 
