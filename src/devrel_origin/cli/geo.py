@@ -4,8 +4,8 @@ Tracks whether ChatGPT / Perplexity / Google AI Overviews mention or cite this
 project, per engine, over time — persisted to the ``geo_visibility`` table.
 
 Roadmap gap B1. `report` probes a prompt set and records rows; `history` and
-`diff` read them back; `fix` (stub) is the closed-loop hook that will draft the
-content/schema change for each un-cited prompt via the Kai pipeline.
+`diff` read them back; `fix` closes the loop — it briefs the content/schema
+change for each un-cited prompt and, with --draft, drafts it via the Kai pipeline.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import tomllib
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
@@ -251,12 +252,132 @@ def diff(
     _console.print(table)
 
 
+# Per-engine fix strategy, grounded in how each engine actually cites.
+_ENGINE_ANGLE = {
+    "chatgpt": (
+        "ChatGPT favors authoritative, recent owned sources — publish or refresh a "
+        "canonical page that answers this directly, with a dated update."
+    ),
+    "perplexity": (
+        "Perplexity leans on community sources (Reddit/HN) — seed an authentic "
+        "community answer and ensure a citable owned page exists."
+    ),
+    "google_aio": (
+        "Google AI Overviews pull structured, well-linked pages — add clear H2/H3 "
+        "question headings, FAQ/HowTo schema, and internal links."
+    ),
+}
+
+
+@dataclass
+class GeoFixBrief:
+    """One un-cited prompt and how to win the citation."""
+
+    prompt_id: str
+    prompt_text: str
+    missing_engines: list[str]
+    angles: list[str]
+    task: str
+
+
+def _fix_task(prompt_text: str) -> str:
+    return (
+        f'Write a canonical answer page for the query "{prompt_text}" that a devtool '
+        "buyer would search. Lead with a direct 2-3 sentence answer, then specifics; "
+        "ground every claim in the repo/KB; include an FAQ block."
+    )
+
+
+def _latest_period(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT MAX(period_end) FROM geo_visibility").fetchone()
+    return row[0] if row else None
+
+
 @geo_app.command("fix")
 def fix(
-    period_end: str = typer.Option("", "--period", help="Period to fix (default: latest)."),
+    period: str = typer.Option("", "--period", help="Period to fix (default: latest)."),
+    prompts_file: Path | None = typer.Option(
+        None, "--prompts-file", "-p", help="Map prompt ids -> text for richer tasks."
+    ),
+    draft: bool = typer.Option(
+        False, "--draft", help="Also draft the fix content via the Kai pipeline."
+    ),
+    top: int = typer.Option(3, "--top", help="How many gaps to draft with --draft."),
 ) -> None:
-    """Draft the content/schema change for each un-cited prompt (closed loop)."""
-    _console.print(
-        "[yellow]`devrel geo fix` not yet implemented (B1 next slice): will feed "
-        "un-cited prompts to the Kai pipeline and draft the fix. Printed-only.[/yellow]"
+    """For each prompt not cited last run, brief the fix (and optionally draft it)."""
+    paths = find_paths_or_exit(_console)
+    if not paths.state_db.is_file():
+        _console.print("[yellow]No state.db yet, run `devrel geo report` first.[/yellow]")
+        raise typer.Exit(code=0)
+
+    text_by_id = (
+        dict(_read_prompts(prompts_file)) if prompts_file and prompts_file.is_file() else {}
     )
+
+    with sqlite3.connect(paths.state_db) as conn:
+        period = period or _latest_period(conn)
+        if not period:
+            _console.print("[yellow]No geo_visibility rows yet.[/yellow]")
+            raise typer.Exit(code=0)
+        rows = conn.execute(
+            "SELECT prompt_id, engine, is_mentioned FROM geo_visibility "
+            "WHERE period_end = ? ORDER BY prompt_id, engine",
+            (period,),
+        ).fetchall()
+
+    missing: dict[str, list[str]] = {}
+    for prompt_id, engine, mentioned in rows:
+        if not mentioned:
+            missing.setdefault(prompt_id, []).append(engine)
+
+    if not missing:
+        _console.print(f"[green]Cited on every engine probed for {period}. 🎉[/green]")
+        raise typer.Exit(code=0)
+
+    briefs = [
+        GeoFixBrief(
+            prompt_id=pid,
+            prompt_text=text_by_id.get(pid, pid),
+            missing_engines=engines,
+            angles=[_ENGINE_ANGLE[e] for e in engines if e in _ENGINE_ANGLE],
+            task=_fix_task(text_by_id.get(pid, pid)),
+        )
+        # most-missing first: prompts absent on more engines are higher leverage
+        for pid, engines in sorted(missing.items(), key=lambda kv: -len(kv[1]))
+    ]
+
+    table = Table(title=f"GEO fix plan: {period} ({len(briefs)} gap(s))")
+    table.add_column("Prompt", style="cyan")
+    table.add_column("Missing on")
+    table.add_column("Do this")
+    for b in briefs:
+        table.add_row(b.prompt_text, ", ".join(b.missing_engines), b.angles[0] if b.angles else "")
+    _console.print(table)
+
+    if not draft:
+        _console.print(
+            "[dim]Re-run with --draft (and keys set) to draft the top fixes via Kai.[/dim]"
+        )
+        return
+
+    # Closed loop: draft the fix content for the top-N gaps via the real pipeline.
+    from devrel_origin.cli.content import (
+        _build_kai,
+        _build_llm_client,
+        _slug,
+        _write_outputs,
+    )
+
+    client = _build_llm_client(paths)
+    kai = _build_kai(paths, client)
+    for b in briefs[: max(0, top)]:
+        _console.print(f"[cyan]Drafting fix for:[/cyan] {b.prompt_text}")
+        result = asyncio.run(
+            kai.execute(task=b.task, content_type="blog_post", editorial_mode="fast")
+        )
+        if result.get("status") != "generated" or not result.get("content"):
+            _console.print(f"[red]Kai did not produce content (prompt {b.prompt_id}).[/red]")
+            continue
+        trace = {"agent": "kai", "geo_prompt_id": b.prompt_id, "geo_period": period}
+        body_path, _ = _write_outputs(paths, _slug(b.task), result["content"], trace)
+        _console.print(f"[green]✓[/green] Wrote {body_path.name}")
