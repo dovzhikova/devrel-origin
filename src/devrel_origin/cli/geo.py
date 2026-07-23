@@ -60,6 +60,9 @@ def _build_probe(paths) -> CitationProbe:
         openai_key=os.environ.get("OPENAI_API_KEY", ""),
         perplexity_key=os.environ.get("PERPLEXITY_API_KEY", ""),
         dfs_auth=os.environ.get("DFS_BASIC", ""),
+        dfs_base=os.environ.get("DFS_BASE", ""),
+        openai_model=os.environ.get("GEO_OPENAI_MODEL", "gpt-4o"),
+        perplexity_model=os.environ.get("GEO_PERPLEXITY_MODEL", "sonar"),
     )
 
 

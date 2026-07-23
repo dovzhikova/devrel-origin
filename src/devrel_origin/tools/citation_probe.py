@@ -9,19 +9,31 @@ This module is deliberately split into two layers:
 
 * ``analyze_mention`` — pure, deterministic analysis of an answer string for a
   brand mention. Implemented and unit-tested now.
-* ``CitationProbe._fetch_answer`` — the live engine call (ChatGPT / Perplexity /
-  Google AI Overviews). Stubbed with a clear interface; wiring real API calls is
-  the next slice of B1. Until a key is configured for an engine, that engine is
-  reported as ``configured=False`` and skipped (no fabricated data).
+* ``CitationProbe._fetch_answer`` — the live engine call (ChatGPT via the OpenAI
+  Responses API + web_search tool, Perplexity chat/completions, Google AI
+  Overviews via DataForSEO). Engines without a configured key are reported
+  ``configured=False`` and skipped; a configured engine whose call fails returns
+  ``None`` too (skipped, never fabricated).
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+import httpx
+
+logger = logging.getLogger(__name__)
+
 # Engines we track, in a stable order. Kept per-engine on purpose.
 ENGINES: tuple[str, ...] = ("chatgpt", "perplexity", "google_aio")
+
+# Live endpoints (overridable models via the CitationProbe ctor).
+_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+_PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
+_DEFAULT_DFS_BASE = "https://api.dataforseo.com"
+_HTTP_TIMEOUT = httpx.Timeout(90.0)
 
 
 @dataclass
@@ -135,6 +147,9 @@ class CitationProbe:
         openai_key: str = "",
         perplexity_key: str = "",
         dfs_auth: str = "",  # DataForSEO Basic auth for Google AI Overviews
+        dfs_base: str = "",
+        openai_model: str = "gpt-4o",
+        perplexity_model: str = "sonar",
     ) -> None:
         self.brand = brand
         self.aliases = aliases or []
@@ -144,24 +159,127 @@ class CitationProbe:
             "perplexity": perplexity_key,
             "google_aio": dfs_auth,
         }
+        self._dfs_base = (dfs_base or _DEFAULT_DFS_BASE).rstrip("/")
+        self._openai_model = openai_model
+        self._perplexity_model = perplexity_model
+
+    async def _post_json(self, url: str, *, headers: dict, json: object) -> dict | None:
+        """POST and return parsed JSON, or ``None`` on any HTTP/parse failure.
+
+        A failed configured engine returns ``None`` (skip) rather than fabricating
+        a "not mentioned" result — we never invent citation data.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+                resp = await client.post(url, headers=headers, json=json)
+                resp.raise_for_status()
+                return resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("citation_probe: POST %s failed: %s", url, exc)
+            return None
+
+    async def _probe_chatgpt(self, prompt: str) -> tuple[str, list[str]] | None:
+        """OpenAI Responses API with the web_search tool → (answer, cited urls)."""
+        data = await self._post_json(
+            _OPENAI_RESPONSES_URL,
+            headers={
+                "Authorization": f"Bearer {self._keys['chatgpt']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self._openai_model,
+                "input": prompt,
+                "tools": [{"type": "web_search"}],
+            },
+        )
+        if data is None:
+            return None
+        parts: list[str] = []
+        urls: list[str] = []
+        for item in data.get("output") or []:
+            if item.get("type") != "message":
+                continue
+            for c in item.get("content") or []:
+                if c.get("type") in ("output_text", "text") and c.get("text"):
+                    parts.append(c["text"])
+                for ann in c.get("annotations") or []:
+                    if ann.get("type") == "url_citation" and ann.get("url"):
+                        urls.append(ann["url"])
+        if not parts and data.get("output_text"):
+            parts.append(str(data["output_text"]))
+        return " ".join(parts), urls
+
+    async def _probe_perplexity(self, prompt: str) -> tuple[str, list[str]] | None:
+        """Perplexity chat/completions → (answer, cited urls)."""
+        data = await self._post_json(
+            _PERPLEXITY_URL,
+            headers={
+                "Authorization": f"Bearer {self._keys['perplexity']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self._perplexity_model,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        if data is None:
+            return None
+        choices = data.get("choices") or []
+        answer = ""
+        if choices:
+            answer = (choices[0].get("message") or {}).get("content", "") or ""
+        urls: list[str] = [u for u in (data.get("citations") or []) if u]
+        if not urls:
+            urls = [r.get("url") for r in (data.get("search_results") or []) if r.get("url")]
+        return answer, urls
+
+    async def _probe_google_aio(self, prompt: str) -> tuple[str, list[str]] | None:
+        """DataForSEO Google organic SERP → the AI Overview block (answer + refs)."""
+        data = await self._post_json(
+            f"{self._dfs_base}/v3/serp/google/organic/live/advanced",
+            headers={
+                "Authorization": f"Basic {self._keys['google_aio']}",
+                "Content-Type": "application/json",
+            },
+            json=[
+                {
+                    "keyword": prompt,
+                    "location_name": "United States",
+                    "language_name": "English",
+                }
+            ],
+        )
+        if data is None:
+            return None
+        try:
+            items = data["tasks"][0]["result"][0]["items"]
+        except (KeyError, IndexError, TypeError):
+            return "", []
+        parts: list[str] = []
+        urls: list[str] = []
+        for it in items or []:
+            if it.get("type") != "ai_overview":
+                continue
+            for el in it.get("items") or []:
+                if el.get("text"):
+                    parts.append(el["text"])
+            for ref in it.get("references") or []:
+                if ref.get("url"):
+                    urls.append(ref["url"])
+        return " ".join(parts), urls
 
     async def _fetch_answer(self, engine: str, prompt: str) -> tuple[str, list[str]] | None:
-        """Return ``(answer_text, cited_urls)`` from a live engine, or ``None`` if
-        the engine has no configured key.
-
-        TODO(B1): implement the real calls (async httpx) —
-          * chatgpt: OpenAI Responses API with web_search tool
-          * perplexity: Perplexity chat/completions (returns citations)
-          * google_aio: DataForSEO SERP AI-mode / AI-Overview endpoint
-        Until then this returns ``None`` for unconfigured engines and raises for
-        configured-but-unimplemented ones so we never fabricate citations.
-        """
+        """Return ``(answer_text, cited_urls)`` from a live engine, or ``None`` when
+        the engine has no key or the call fails (skipped, never fabricated)."""
         if not self._keys.get(engine):
             return None
-        raise NotImplementedError(
-            f"live probe for {engine!r} not wired yet (B1). Key is set but the "
-            "engine call is a stub; see citation_probe.CitationProbe._fetch_answer."
-        )
+        if engine == "chatgpt":
+            return await self._probe_chatgpt(prompt)
+        if engine == "perplexity":
+            return await self._probe_perplexity(prompt)
+        if engine == "google_aio":
+            return await self._probe_google_aio(prompt)
+        return None
 
     async def probe(self, prompts: list[tuple[str, str]]) -> list[CitationResult]:
         """Probe every configured engine for each ``(prompt_id, prompt_text)``.
