@@ -26,6 +26,7 @@ from rich.table import Table
 
 from devrel_origin.cli._common import find_paths_or_exit
 from devrel_origin.tools.citation_probe import ENGINES, CitationProbe
+from devrel_origin.tools.geo_audit import run_geo_audit
 
 geo_app = typer.Typer(
     name="geo",
@@ -381,3 +382,44 @@ def fix(
         trace = {"agent": "kai", "geo_prompt_id": b.prompt_id, "geo_period": period}
         body_path, _ = _write_outputs(paths, _slug(b.task), result["content"], trace)
         _console.print(f"[green]✓[/green] Wrote {body_path.name}")
+
+
+_STATUS_STYLE = {"pass": "[green]✓[/green]", "warn": "[yellow]![/yellow]", "fail": "[red]✗[/red]"}
+
+
+@geo_app.command("audit")
+def audit(
+    url: str = typer.Argument(..., help="Site URL to audit (e.g. https://example.com)."),
+    format: str = typer.Option("table", "--format", help="table|json"),
+) -> None:
+    """Free GEO-hygiene check: AI crawler access, llms.txt, schema, sitemap. No auth."""
+    report = asyncio.run(run_geo_audit(url))
+
+    if format == "json":
+        _console.print(
+            json.dumps(
+                {
+                    "url": report.url,
+                    "score": report.score,
+                    "checks": [
+                        {"key": c.key, "status": c.status, "detail": c.detail, "fix": c.fix}
+                        for c in report.checks
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    table = Table(title=f"GEO hygiene: {report.url}  —  score {report.score}/100")
+    table.add_column("", justify="center")
+    table.add_column("Check", style="cyan")
+    table.add_column("Detail")
+    for c in report.checks:
+        table.add_row(_STATUS_STYLE.get(c.status, "?"), c.label, c.detail)
+    _console.print(table)
+    fixes = [c for c in report.checks if c.status != "pass" and c.fix]
+    if fixes:
+        _console.print("\n[bold]Fixes:[/bold]")
+        for c in fixes:
+            _console.print(f"  • [cyan]{c.label}[/cyan]: {c.fix}")
