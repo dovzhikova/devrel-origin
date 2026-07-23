@@ -1,25 +1,36 @@
 """CLI smoke tests for `devrel geo ...`."""
 
+import re
 import sqlite3
 
 from typer.testing import CliRunner
 
 from devrel_origin.cli import app
 
+# Rich colorizes --help output with ANSI escapes that can split option names
+# across resets (e.g. "--prompts" <reset> "-file"), which breaks naive
+# substring asserts under CI's colored/width-wrapped rendering. Strip them.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    return _ANSI_RE.sub("", text).lower()
+
 
 def test_geo_help_lists_subcommands():
     runner = CliRunner()
     result = runner.invoke(app, ["geo", "--help"])
     assert result.exit_code == 0
+    plain = _plain(result.output)
     for verb in ("report", "history", "diff", "fix"):
-        assert verb in result.output.lower()
+        assert verb in plain
 
 
 def test_geo_report_help_runs():
     runner = CliRunner()
     result = runner.invoke(app, ["geo", "report", "--help"])
     assert result.exit_code == 0
-    assert "prompts-file" in result.output.lower()
+    assert "prompts-file" in _plain(result.output)
 
 
 def test_geo_report_persists_geo_visibility_rows(tmp_path, monkeypatch):
