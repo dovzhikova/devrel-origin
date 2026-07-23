@@ -20,6 +20,7 @@ from devrel_origin.cli.deliverables import deliverables_app
 from devrel_origin.cli.docs import docs_app
 from devrel_origin.cli.doctor import doctor_command
 from devrel_origin.cli.experiment import experiment_command
+from devrel_origin.cli.geo import geo_app
 from devrel_origin.cli.growth import growth_app
 from devrel_origin.cli.init import init_command
 from devrel_origin.cli.intel import intel_command
@@ -68,6 +69,7 @@ app.command(name="doctor")(doctor_command)
 app.command(name="migrate")(migrate_command)
 app.add_typer(content_app, name="content")
 app.add_typer(cro_app, name="cro")
+app.add_typer(geo_app, name="geo")
 app.command(name="run")(run_command)
 app.command(name="triage")(triage_command)
 app.command(name="listen")(listen_command)
