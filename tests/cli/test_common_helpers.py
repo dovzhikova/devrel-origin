@@ -255,7 +255,7 @@ class TestBuildAtlasWiring:
                 assert st is not None
 
     def test_atlas_exits_without_anthropic_key(self, tmp_path):
-        import click
+        import typer
 
         paths = _make_paths(tmp_path)
         paths.config_file.write_text('[project]\nname = "X"\n')
@@ -265,7 +265,7 @@ class TestBuildAtlasWiring:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ANTHROPIC_API_KEY", None)
             os.environ.pop("OPENROUTER_API_KEY", None)
-            with pytest.raises(click.exceptions.Exit):
+            with pytest.raises(typer.Exit):
                 build_atlas_or_exit(paths, console)
 
 
@@ -336,7 +336,7 @@ class TestLLMClientWiring:
         }
 
     def test_exits_when_provider_openrouter_but_no_or_key(self, tmp_path):
-        import click
+        import typer
 
         from devrel_origin.cli._common import _build_llm_client
 
@@ -348,7 +348,7 @@ class TestLLMClientWiring:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ANTHROPIC_API_KEY", None)
             os.environ.pop("OPENROUTER_API_KEY", None)
-            with pytest.raises(click.exceptions.Exit):
+            with pytest.raises(typer.Exit):
                 _build_llm_client(paths, console)
 
 
