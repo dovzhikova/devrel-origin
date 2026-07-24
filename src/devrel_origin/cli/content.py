@@ -226,6 +226,17 @@ def slop_command(
 def audit_command(
     file: Path = typer.Argument(..., exists=True, readable=True, help="Existing draft to audit."),
     content_type: str = typer.Option("tutorial", "--type"),
+    ground: bool = typer.Option(
+        False,
+        "--ground/--no-ground",
+        help="Run the grounding stage (verify factual claims against KB + repo). "
+        "Off by default; enable for high-value artifacts (hero, CTA).",
+    ),
+    cut_unsourced: bool = typer.Option(
+        False,
+        "--cut-unsourced",
+        help="With --ground, delete unsourced claim sentences instead of only flagging them.",
+    ),
 ) -> None:
     """Run the editorial pipeline against an existing draft file."""
     try:
@@ -238,22 +249,55 @@ def audit_command(
 
     async def _do() -> None:
         body = file.read_text()
+        repo_facts: list[dict] | None = None
+        if ground:
+            repo_facts = await _fetch_repo_facts()
         try:
             result = await run_pipeline(
                 initial_draft=body,
                 content_type=content_type,
                 project_paths=paths,
                 llm_client=client,
+                ground=ground,
+                repo_facts=repo_facts,
+                cut_unsourced=cut_unsourced,
             )
         except AbortLoud as e:
             console.print(f"[red]Pipeline aborted: {e}[/red]")
             raise typer.Exit(code=1) from None
-        body_path, trace_path = _write_outputs(
-            paths, _slug(file.stem), result.final_text, result.revision_trace
-        )
+        # Persist provenance alongside the revision trace so
+        # `devrel deliverables provenance` can render it later.
+        trace = dict(result.revision_trace)
+        if isinstance(result.provenance, dict):
+            trace["provenance"] = result.provenance
+        body_path, trace_path = _write_outputs(paths, _slug(file.stem), result.final_text, trace)
         console.print(f"[green]✓[/green] Wrote {body_path.name}")
         console.print(f"[green]✓[/green] Wrote {trace_path.name}")
+        if ground:
+            gs = result.provenance.get("grounding_summary", {})
+            console.print(
+                f"[cyan]Grounding:[/cyan] {gs.get('grounded_claims', 0)}/"
+                f"{gs.get('total_claims', 0)} claims sourced"
+            )
         if result.flagged:
             console.print("[yellow]⚠[/yellow] Flagged.")
 
     asyncio.run(_do())
+
+
+async def _fetch_repo_facts() -> list[dict] | None:
+    """Fetch draft-independent repo facts (commits + stats) for grounding.
+    Degrades to None when the GitHub client is unavailable."""
+    repo = os.environ.get("GITHUB_REPO", "").strip()
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    try:
+        from devrel_origin.tools.github_tools import GitHubTools
+
+        gh = GitHubTools(token=token, repo=repo) if repo else GitHubTools(token=token)
+        try:
+            return await gh.get_repo_facts()
+        finally:
+            await gh.close()
+    except Exception as exc:  # noqa: BLE001 - grounding degrades, never blocks
+        console.print(f"[yellow]⚠[/yellow] Could not fetch repo facts: {exc}")
+        return None

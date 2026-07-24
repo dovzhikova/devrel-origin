@@ -228,6 +228,81 @@ def test_deliverables_show_multiple_matches(tmp_path):
     assert "beta-post.md" in r.output
 
 
+# ---- deliverables provenance -----------------------------------------
+
+
+def _seed_trace(tmp_path, name, trace):
+    import json
+
+    d = tmp_path / ".devrel" / "deliverables"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(json.dumps(trace))
+
+
+def test_deliverables_provenance_from_stages(tmp_path):
+    """Renders a PR-style summary from a trace's stages when no prebuilt
+    provenance block is present."""
+    _init(tmp_path)
+    _seed_trace(
+        tmp_path,
+        "20260101-hero-trace.json",
+        {
+            "content_type": "hero",
+            "stages": [
+                {"name": "copy_edit", "text_before": "a", "text_after": "b", "score": 8},
+            ],
+            "grounding": None,
+        },
+    )
+    r = _run(tmp_path, ["deliverables", "provenance", "hero"])
+    assert r.exit_code == 0, r.output
+    assert "Provenance" in r.output
+    assert "copy_edit" in r.output
+    assert "Grounding: not run" in r.output
+
+
+def test_deliverables_provenance_uses_prebuilt_block(tmp_path):
+    _init(tmp_path)
+    _seed_trace(
+        tmp_path,
+        "20260101-cta-trace.json",
+        {
+            "content_type": "cta",
+            "provenance": {
+                "artifact": "cta-v1",
+                "content_type": "cta",
+                "stages": [],
+                "grounding_ran": True,
+                "grounded_ok": True,
+                "grounding_summary": {
+                    "total_claims": 1,
+                    "grounded_claims": 1,
+                    "flagged_count": 0,
+                    "cut_applied": False,
+                },
+                "citations": [
+                    {
+                        "claim": "supports OTel",
+                        "kind": "capability",
+                        "sources": [{"origin": "kb", "ref": "docs/otel.md"}],
+                    }
+                ],
+                "unsourced": [],
+            },
+        },
+    )
+    r = _run(tmp_path, ["deliverables", "provenance", "cta"])
+    assert r.exit_code == 0, r.output
+    assert "Grounding: PASS" in r.output
+    assert "kb:docs/otel.md" in r.output
+
+
+def test_deliverables_provenance_no_match(tmp_path):
+    _init(tmp_path)
+    r = _run(tmp_path, ["deliverables", "provenance", "nope"])
+    assert r.exit_code == 1, r.output
+
+
 # ---- config ----------------------------------------------------------
 
 
