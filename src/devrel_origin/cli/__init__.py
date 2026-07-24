@@ -28,6 +28,7 @@ from devrel_origin.cli.kb import kb_app
 from devrel_origin.cli.listen import listen_command
 from devrel_origin.cli.marketing import marketing_app
 from devrel_origin.cli.migrate import migrate_command
+from devrel_origin.cli.next import next_app
 from devrel_origin.cli.run import run_command
 from devrel_origin.cli.sales import sales_app
 from devrel_origin.cli.schedule import schedule_app
@@ -70,6 +71,7 @@ app.command(name="migrate")(migrate_command)
 app.add_typer(content_app, name="content")
 app.add_typer(cro_app, name="cro")
 app.add_typer(geo_app, name="geo")
+app.add_typer(next_app, name="next")
 app.command(name="run")(run_command)
 app.command(name="triage")(triage_command)
 app.command(name="listen")(listen_command)
