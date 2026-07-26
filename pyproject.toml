@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "devrel-origin"
-version = "0.2.16"
+version = "0.3.0"
 description = "A 15-agent CLI that runs DevRel, sales, and marketing on your repo. BYO Anthropic or OpenRouter key."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -93,7 +93,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.1.0",
     "respx>=0.20.2",
-    "ruff>=0.1.0",
+    "ruff>=0.15,<0.16",
     "mypy>=1.5.0",
     "build>=1.0.0",
     "twine>=5.0.0",
