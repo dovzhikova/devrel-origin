@@ -29,7 +29,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from devrel_origin.project.paths import ProjectPaths
+from devrel_origin.quality.grounding import GroundingResult, ground_claims
 from devrel_origin.quality.persona import test_against_persona
+from devrel_origin.quality.provenance import build_provenance
 from devrel_origin.quality.readability import check_against_target, compute_readability
 from devrel_origin.quality.slop import find_slop, force_rewrite, llm_lint, parse_blocklist
 from devrel_origin.quality.style import get_targets, load_style
@@ -61,6 +63,7 @@ class EditorialResult:
     stages: list[StageResult]
     flagged: bool
     revision_trace: dict[str, Any]
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 _DEV_EDIT_SYSTEM = """You are a developmental editor. Improve the draft for:
@@ -213,14 +216,68 @@ def _readability_stage(*, text: str, content_type: str, style_md: str) -> StageR
     )
 
 
+async def _grounding_stage(
+    *,
+    text: str,
+    project_paths: ProjectPaths,
+    llm_client,
+    repo_facts: list[dict[str, Any]] | None,
+    cut_unsourced: bool,
+) -> tuple[str, StageResult, GroundingResult]:
+    """Optional stage: verify factual claims against the KB + repo facts.
+
+    Runs only when ``ground=True``. Flags unsourced claims (and cuts them when
+    ``cut_unsourced=True``). Never smooths a claim over; an unprovable claim is
+    surfaced, not paraphrased away."""
+    # Imported lazily: devrel_origin.core.__init__ eagerly loads Atlas, which
+    # imports this module, so a top-level core.base import would cycle.
+    from devrel_origin.core.base import KnowledgeBaseSearch
+
+    t0 = time.monotonic()
+    kb = KnowledgeBaseSearch(project_paths.kb_dir)
+    gr = await ground_claims(
+        text=text,
+        kb=kb,
+        llm_client=llm_client,
+        repo_facts=repo_facts,
+        cut_unsourced=cut_unsourced,
+    )
+    issues = [f"Unsourced: {c.claim.text}" for c in gr.flagged]
+    sr = StageResult(
+        name="grounding",
+        text_before=text,
+        text_after=gr.text_after,
+        duration_s=round(time.monotonic() - t0, 3),
+        issues=issues,
+        detail=(
+            f"{gr.grounded_claims}/{gr.total_claims} grounded" + (", cut" if gr.cut_applied else "")
+        ),
+    )
+    return gr.text_after, sr, gr
+
+
 async def run_pipeline(
     *,
     initial_draft: str,
     content_type: str,
     project_paths: ProjectPaths,
     llm_client,
+    ground: bool = False,
+    repo_facts: list[dict[str, Any]] | None = None,
+    cut_unsourced: bool = False,
 ) -> EditorialResult:
-    """Run the 8-stage editorial pipeline. See module docstring."""
+    """Run the 8-stage editorial pipeline. See module docstring.
+
+    Args:
+        ground: When True, run the optional grounding stage after readability.
+            Defaults to False because grounding adds latency and cost; enable it
+            for high-value artifacts (hero, CTA, landing pages).
+        repo_facts: Pre-fetched repo facts (commits / stats) as dicts with
+            ``ref`` and ``excerpt`` keys, used as grounding sources. Only
+            consulted when ``ground=True``.
+        cut_unsourced: When True (and ``ground=True``), delete unsourced claim
+            sentences from the final text. When False, they are only flagged.
+    """
     voice = load_voice(project_paths)
     style_md = load_style(project_paths)
     blocklist = parse_blocklist(
@@ -339,6 +396,22 @@ async def run_pipeline(
             )
             raise AbortLoud(f"Persona gate failed after repair for {content_type}: {issue_text}")
 
+    # Optional grounding stage (Stage 5b): claims → sources, unsourced flagged.
+    grounding_dict: dict[str, Any] | None = None
+    if ground:
+        text, grounding_sr, grounding_result = await _grounding_stage(
+            text=text,
+            project_paths=project_paths,
+            llm_client=llm_client,
+            repo_facts=repo_facts,
+            cut_unsourced=cut_unsourced,
+        )
+        stages.append(grounding_sr)
+        grounding_dict = grounding_result.to_dict()
+        # An unsourced claim that survives (not cut) makes the artifact flagged.
+        if grounding_result.flagged and not grounding_result.cut_applied:
+            flagged = True
+
     revision_trace = {
         "content_type": content_type,
         "voice_present": bool(voice),
@@ -346,11 +419,19 @@ async def run_pipeline(
         "blocklist_size": len(blocklist),
         "stages": [asdict(s) for s in stages],
         "flagged": flagged,
+        "grounding": grounding_dict,
     }
+
+    provenance = build_provenance(
+        content_type=content_type,
+        stages=revision_trace["stages"],
+        grounding=grounding_dict,
+    )
 
     return EditorialResult(
         final_text=text,
         stages=stages,
         flagged=flagged,
         revision_trace=revision_trace,
+        provenance=provenance,
     )

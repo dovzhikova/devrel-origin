@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.0: anti-slop grounding + `devrel next` action queue (2026-07-26)
+
+Phase B (roadmap items B2 + B3): a claim-grounding quality stage with a
+provenance trail, plus a ranked action queue that closes the loop from
+analysis to next steps.
+
+### Added
+
+- **`devrel next` ranked action queue (B3).** New command that surfaces a
+  prioritized list of recommended next actions for a project, wiring
+  analysis output into an actionable, ranked queue.
+- **Grounding stage in the editorial pipeline (B2).** New
+  `quality.grounding` stage verifies factual claims against repo facts
+  before content ships, with a `--grounding` CLI flag to enable it.
+- **Provenance trail (`quality.provenance`).** Records and renders the
+  evidence chain behind grounded claims, exposed via CLI provenance
+  rendering.
+- **GitHub repo-facts helpers (`tools.github_tools`).** Fetch structured
+  repository facts used by the grounding stage to substantiate claims.
+
+### Changed
+
+- Pinned `ruff` to `>=0.15,<0.16` in dev dependencies so lint/format
+  checks are reproducible across local and CI (newer ruff began
+  reformatting Markdown code blocks, breaking the format gate).
+
 ## 0.2.16: doctor video-extra hint bracket escape (2026-05-14)
 
 ### Fixed

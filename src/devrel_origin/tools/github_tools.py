@@ -42,6 +42,17 @@ class GitHubIssue:
 
 
 @dataclass
+class GitCommit:
+    """Parsed GitHub commit (a repo fact usable for grounding claims)."""
+
+    sha: str
+    message: str
+    author: str
+    date: str
+    url: str = ""
+
+
+@dataclass
 class ContributorProfile:
     """Summary of a GitHub contributor's activity."""
 
@@ -279,6 +290,59 @@ class GitHubTools:
         )
         resp.raise_for_status()
         return resp.json()
+
+    # -- Commits (repo facts for grounding) -------------------------------
+
+    async def fetch_recent_commits(self, per_page: int = 30) -> list[GitCommit]:
+        """Fetch recent commits to the default branch. These are repo FACTS a
+        grounding stage can check claims against (e.g. "we shipped X")."""
+        resp = await self._client.get(
+            f"/repos/{self.repo}/commits",
+            params={"per_page": per_page},
+        )
+        resp.raise_for_status()
+        commits: list[GitCommit] = []
+        for item in resp.json():
+            commit = item.get("commit", {})
+            author = commit.get("author", {}) or {}
+            commits.append(
+                GitCommit(
+                    sha=item.get("sha", ""),
+                    message=commit.get("message", ""),
+                    author=author.get("name", ""),
+                    date=author.get("date", ""),
+                    url=item.get("html_url", ""),
+                )
+            )
+        logger.info(f"Fetched {len(commits)} commits from {self.repo}")
+        return commits
+
+    async def get_repo_facts(self, commit_limit: int = 30) -> list[dict[str, str]]:
+        """Assemble draft-independent repo facts (recent commits + repo stats)
+        as grounding-source dicts with ``ref`` and ``excerpt`` keys. Failures
+        in either source degrade gracefully to whatever was retrievable."""
+        facts: list[dict[str, str]] = []
+        try:
+            for c in await self.fetch_recent_commits(per_page=commit_limit):
+                summary = c.message.splitlines()[0] if c.message else ""
+                facts.append({"ref": f"commit:{c.sha[:10]}", "excerpt": summary})
+        except Exception as exc:
+            logger.warning(f"Could not fetch commits for repo facts: {exc}")
+        try:
+            stats = await self.get_repo_stats()
+            facts.append(
+                {
+                    "ref": "repo_stats",
+                    "excerpt": (
+                        f"{stats['stars']} stars, {stats['forks']} forks, "
+                        f"{stats['open_issues']} open issues, "
+                        f"primary language {stats['language']}."
+                    ),
+                }
+            )
+        except Exception as exc:
+            logger.warning(f"Could not fetch repo stats for repo facts: {exc}")
+        return facts
 
     # -- Repo Stats -------------------------------------------------------
 
