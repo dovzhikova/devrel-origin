@@ -12,8 +12,8 @@ import logging
 from devrel_origin.quality.judgments import UNAVAILABLE, ClaimVerdict, PatternVerdict
 from devrel_origin.quality.questions import (
     IS_FACTUAL_CLAIM,
-    PATTERN,
     PATTERN_NONE,
+    PATTERN_NOULS,
     RELATION,
 )
 
@@ -110,32 +110,47 @@ class TypeSafeJudge:
         return out
 
     async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:
+        """One Noul per pattern per unit: a unit can exhibit more than one.
+
+        Whole units are packed per request, never split: a unit's own
+        question count (one per PATTERN_NOULS entry) sets how many units fit
+        under `max_questions_per_request`, at least one unit per request.
+        """
         self._reset_usage()
-        from typesafe_sdk import Choice
+        from typesafe_sdk import Noul
+
+        pattern_keys = list(PATTERN_NOULS)
+        questions_per_unit = len(pattern_keys)
+        units_per_request = max(1, self._chunk // questions_per_unit)
 
         out: list[PatternVerdict] = []
-        for start in range(0, len(units), self._chunk):
-            batch = units[start : start + self._chunk]
+        for start in range(0, len(units), units_per_request):
+            batch = units[start : start + units_per_request]
             names = [f"unit_{start + i}" for i in range(len(batch))]
             state = {"voice": voice, **dict(zip(names, batch, strict=True))}
             questions = {
-                n: Choice(
-                    instructions=PATTERN.instructions.replace("`unit`", f"`{n}`"),
-                    criteria=dict(PATTERN.criteria),
+                f"{n}__{pattern}": Noul(
+                    instructions=PATTERN_NOULS[pattern].instructions.replace("`unit`", f"`{n}`")
                 )
                 for n in names
+                for pattern in pattern_keys
             }
             try:
                 resp = await self._ask(state, questions)
                 for i, n in enumerate(names):
-                    answer = resp.choices[n]
+                    probabilities = {
+                        pattern: float(resp.nouls[f"{n}__{pattern}"].noul)
+                        for pattern in pattern_keys
+                    }
+                    best_pattern = max(probabilities, key=probabilities.get)
                     out.append(
                         PatternVerdict(
                             unit_index=start + i,
-                            pattern=answer.choice,
-                            confidence=float(answer.confidence),
+                            pattern=best_pattern,
+                            confidence=probabilities[best_pattern],
                             available=True,
                             backend=BACKEND,
+                            probabilities=probabilities,
                         )
                     )
             except Exception as exc:

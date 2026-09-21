@@ -1,6 +1,7 @@
 import pytest
 
 from devrel_origin.quality.judgments_typesafe import TypeSafeJudge
+from devrel_origin.quality.questions import PATTERN_NONE, PATTERN_NOULS
 
 
 class _Answer:
@@ -9,9 +10,15 @@ class _Answer:
         self.confidence = confidence
 
 
+class _Noul:
+    def __init__(self, noul):
+        self.noul = noul
+
+
 class _Resp:
-    def __init__(self, choices, usage=(657, 79)):
-        self.choices = choices
+    def __init__(self, choices=None, nouls=None, usage=(657, 79)):
+        self.choices = choices or {}
+        self.nouls = nouls or {}
         self.model = "jev-1.13.0"
 
         class _U:
@@ -25,22 +32,29 @@ class _Resp:
 class _StubClient:
     """Stands in for AsyncTypeSafeClient. No network, no SDK import."""
 
-    def __init__(self, answers_by_call, usage_by_call=None):
-        self.answers_by_call = list(answers_by_call)
+    def __init__(self, responses, usage_by_call=None):
+        self.responses = list(responses)
         self.usage_by_call = list(usage_by_call) if usage_by_call is not None else None
         self.calls = []
 
     async def system_one(self, state, questions, **kwargs):
         self.calls.append((state, questions))
-        choices = self.answers_by_call.pop(0)
-        if self.usage_by_call is not None:
-            return _Resp(choices, usage=self.usage_by_call.pop(0))
-        return _Resp(choices)
+        payload = self.responses.pop(0)
+        usage = self.usage_by_call.pop(0) if self.usage_by_call is not None else (657, 79)
+        return _Resp(usage=usage, **payload)
+
+
+def _nouls_for_unit(unit_key, high_pattern, high_prob=0.9, low_prob=0.05):
+    """Every pattern's Noul for one unit, one pattern high, the rest low."""
+    return {
+        f"{unit_key}__{pattern}": _Noul(high_prob if pattern == high_pattern else low_prob)
+        for pattern in PATTERN_NOULS
+    }
 
 
 @pytest.mark.asyncio
 async def test_verify_claim_maps_the_choice_and_confidence():
-    client = _StubClient([{"relation": _Answer("supports", 0.65)}])
+    client = _StubClient([{"choices": {"relation": _Answer("supports", 0.65)}}])
     judge = TypeSafeJudge(api_key="sk-test", client=client)
 
     verdict = await judge.verify_claim(claim="It adds a queue.", evidence="feat: add queue")
@@ -56,34 +70,68 @@ async def test_verify_claim_maps_the_choice_and_confidence():
 
 
 @pytest.mark.asyncio
-async def test_all_units_ride_in_one_request():
-    answers = {f"unit_{i}": _Answer("none", 0.9) for i in range(3)}
-    answers["unit_1"] = _Answer("colon_reveal", 0.81)
-    client = _StubClient([answers])
+async def test_argmax_pattern_and_max_confidence():
+    client = _StubClient([{"nouls": _nouls_for_unit("unit_0", "colon_reveal", high_prob=0.81)}])
     judge = TypeSafeJudge(api_key="sk-test", client=client)
 
-    verdicts = await judge.judge_patterns(units=["a", "b", "c"], voice="plain")
+    verdicts = await judge.judge_patterns(units=["a"], voice="plain")
 
-    assert len(client.calls) == 1, "one request per draft, not one per unit"
-    assert [v.pattern for v in verdicts] == ["none", "colon_reveal", "none"]
-    assert verdicts[1].confidence == 0.81
-    assert all(v.available for v in verdicts)
+    assert len(verdicts) == 1
+    assert verdicts[0].pattern == "colon_reveal"
+    assert verdicts[0].confidence == 0.81
+    assert verdicts[0].available is True
+    assert verdicts[0].backend == "typesafe"
 
 
 @pytest.mark.asyncio
-async def test_units_are_chunked_when_over_the_cap():
+async def test_probabilities_carries_every_pattern():
+    client = _StubClient([{"nouls": _nouls_for_unit("unit_0", "throat_clearing")}])
+    judge = TypeSafeJudge(api_key="sk-test", client=client)
+
+    verdicts = await judge.judge_patterns(units=["a"], voice="")
+
+    assert set(verdicts[0].probabilities) == set(PATTERN_NOULS)
+    assert verdicts[0].probabilities["throat_clearing"] == 0.9
+    assert verdicts[0].probabilities["colon_reveal"] == 0.05
+
+
+@pytest.mark.asyncio
+async def test_units_within_the_cap_share_one_request():
+    nouls = {
+        **_nouls_for_unit("unit_0", "binary_contrast"),
+        **_nouls_for_unit("unit_1", "colon_reveal"),
+    }
+    client = _StubClient([{"nouls": nouls}])
+    judge = TypeSafeJudge(api_key="sk-test", client=client)
+
+    verdicts = await judge.judge_patterns(units=["a", "b"], voice="plain")
+
+    assert len(client.calls) == 1, "two units' questions fit the default cap"
+    assert [v.pattern for v in verdicts] == ["binary_contrast", "colon_reveal"]
+    assert [v.unit_index for v in verdicts] == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_a_units_questions_never_span_two_requests_and_indices_stay_global():
+    # Per-pattern Nouls means one unit alone (10 questions) already exceeds a
+    # cap of 15: each unit must land in its own request, never split.
     client = _StubClient(
         [
-            {f"unit_{i}": _Answer("none", 0.9) for i in range(2)},
-            {f"unit_{i}": _Answer("none", 0.9) for i in range(2, 3)},
+            {"nouls": _nouls_for_unit("unit_0", "binary_contrast")},
+            {"nouls": _nouls_for_unit("unit_1", "colon_reveal")},
+            {"nouls": _nouls_for_unit("unit_2", "throat_clearing")},
         ]
     )
-    judge = TypeSafeJudge(api_key="sk-test", client=client, max_questions_per_request=2)
+    judge = TypeSafeJudge(api_key="sk-test", client=client, max_questions_per_request=15)
 
     verdicts = await judge.judge_patterns(units=["a", "b", "c"], voice="")
 
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
     assert [v.unit_index for v in verdicts] == [0, 1, 2]
+    assert [v.pattern for v in verdicts] == ["binary_contrast", "colon_reveal", "throat_clearing"]
+    for state, questions in client.calls:
+        unit_keys = [k for k in state if k != "voice"]
+        assert len(unit_keys) == 1, "a unit's questions never span two requests"
 
 
 @pytest.mark.asyncio
@@ -100,21 +148,48 @@ async def test_a_service_failure_degrades_to_unavailable_not_an_exception():
 
     verdicts = await judge.judge_patterns(units=["a", "b"], voice="")
     assert [v.available for v in verdicts] == [False, False]
+    assert all(v.pattern == PATTERN_NONE for v in verdicts)
+    assert all(v.probabilities is None for v in verdicts)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_request_degrades_only_its_own_units():
+    class _PartialFailClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def system_one(self, state, questions, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(nouls=_nouls_for_unit("unit_0", "binary_contrast"))
+            raise RuntimeError("503 from the service")
+
+    judge = TypeSafeJudge(
+        api_key="sk-test", client=_PartialFailClient(), max_questions_per_request=15
+    )
+
+    verdicts = await judge.judge_patterns(units=["a", "b"], voice="")
+
+    assert verdicts[0].available is True
+    assert verdicts[0].pattern == "binary_contrast"
+    assert verdicts[1].available is False
+    assert verdicts[1].pattern == PATTERN_NONE
+    assert verdicts[1].probabilities is None
 
 
 @pytest.mark.asyncio
 async def test_last_usage_sums_tokens_across_chunked_requests_then_resets_on_next_call():
     client = _StubClient(
         [
-            {f"unit_{i}": _Answer("none", 0.9) for i in range(2)},
-            {f"unit_{i}": _Answer("none", 0.9) for i in range(2, 3)},
-            {"relation": _Answer("supports", 0.5)},
+            {"nouls": _nouls_for_unit("unit_0", "binary_contrast")},
+            {"nouls": _nouls_for_unit("unit_1", "colon_reveal")},
+            {"choices": {"relation": _Answer("supports", 0.5)}},
         ],
         usage_by_call=[(100, 10), (50, 5), (7, 3)],
     )
-    judge = TypeSafeJudge(api_key="sk-test", client=client, max_questions_per_request=2)
+    judge = TypeSafeJudge(api_key="sk-test", client=client, max_questions_per_request=15)
 
-    await judge.judge_patterns(units=["a", "b", "c"], voice="")
+    await judge.judge_patterns(units=["a", "b"], voice="")
     assert judge.last_usage == {"input_tokens": 150, "output_tokens": 15}
 
     # A subsequent public call resets the accumulator rather than adding to it.
@@ -144,7 +219,7 @@ async def test_verify_claim_uses_the_owned_client_when_none_is_injected(monkeypa
 
         async def system_one(self, state, questions, **kwargs):
             self.system_one_called = True
-            return _Resp({"relation": _Answer("supports", 0.9)})
+            return _Resp(choices={"relation": _Answer("supports", 0.9)})
 
     monkeypatch.setattr("typesafe_sdk.AsyncTypeSafeClient", _FakeOwnedClient)
 
