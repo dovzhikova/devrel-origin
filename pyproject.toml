@@ -104,8 +104,8 @@ dev = [
     "mypy>=1.5.0",
     "build>=1.0.0",
     "twine>=5.0.0",
-    # dev installs always pull video + growth deps so tests can exercise the full pipeline
-    "devrel-origin[video,growth]",
+    # dev installs always pull video + growth + typesafe deps so tests can exercise the full pipeline
+    "devrel-origin[video,growth,typesafe]",
 ]
 
 [project.urls]

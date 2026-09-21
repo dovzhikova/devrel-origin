@@ -22,29 +22,10 @@ logger = logging.getLogger(__name__)
 BACKEND = "typesafe"
 
 
-def _question_types():
-    """(Choice, Noul), preferring the real SDK classes when the extra is installed.
-
-    Falls back to `SimpleNamespace` so a caller that injects its own client (every
-    test in this suite) can build question payloads without the optional `typesafe`
-    extra: those callers never inspect the payload's type, only the attributes
-    `_ask` reads back off the response. Production always has the real classes,
-    because `build_judge()` only ever constructs `TypeSafeJudge` after
-    `_sdk_available()` has confirmed the extra imports cleanly.
-    """
-    try:
-        from typesafe_sdk import Choice, Noul
-
-        return Choice, Noul
-    except ImportError:
-        from types import SimpleNamespace
-
-        return SimpleNamespace, SimpleNamespace
-
-
 def _to_choice(spec):
-    choice_type, _ = _question_types()
-    return choice_type(instructions=spec.instructions, criteria=dict(spec.criteria))
+    from typesafe_sdk import Choice
+
+    return Choice(instructions=spec.instructions, criteria=dict(spec.criteria))
 
 
 class TypeSafeJudge:
@@ -100,7 +81,7 @@ class TypeSafeJudge:
 
     async def select_claims(self, *, sentences: list[str]) -> list[float]:
         """One `is_factual_claim` Noul per sentence, batched into one request."""
-        _, noul_type = _question_types()
+        from typesafe_sdk import Noul
 
         out: list[float] = []
         for start in range(0, len(sentences), self._chunk):
@@ -108,9 +89,7 @@ class TypeSafeJudge:
             names = [f"sentence_{start + i}" for i in range(len(batch))]
             state = dict(zip(names, batch, strict=True))
             questions = {
-                n: noul_type(
-                    instructions=IS_FACTUAL_CLAIM.instructions.replace("`sentence`", f"`{n}`")
-                )
+                n: Noul(instructions=IS_FACTUAL_CLAIM.instructions.replace("`sentence`", f"`{n}`"))
                 for n in names
             }
             try:
@@ -122,7 +101,7 @@ class TypeSafeJudge:
         return out
 
     async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:
-        choice_type, _ = _question_types()
+        from typesafe_sdk import Choice
 
         out: list[PatternVerdict] = []
         for start in range(0, len(units), self._chunk):
@@ -130,7 +109,7 @@ class TypeSafeJudge:
             names = [f"unit_{start + i}" for i in range(len(batch))]
             state = {"voice": voice, **dict(zip(names, batch, strict=True))}
             questions = {
-                n: choice_type(
+                n: Choice(
                     instructions=PATTERN.instructions.replace("`unit`", f"`{n}`"),
                     criteria=dict(PATTERN.criteria),
                 )
