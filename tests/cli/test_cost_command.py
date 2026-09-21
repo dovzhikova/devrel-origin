@@ -167,6 +167,27 @@ def test_cost_total_line_all_unpriced_shows_na(tmp_path):
     assert "n/a" in total_line
 
 
+def test_cost_json_by_agent_reports_unpriced_calls(tmp_path):
+    """FINAL RE-REVIEW part A, Minor: an all-unpriced agent's `usd: 0.0` must
+    not read as "free". Every `by_agent` entry carries `unpriced_calls` (0
+    when none), so a machine reader can tell "$0 because free" apart from
+    "$0 because every call here is unpriced"."""
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        _init(tmp_path)
+        _seed_mixed_costs(tmp_path)
+    finally:
+        os.chdir(cwd)
+
+    result = _run_in(tmp_path, "cost", "--json")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["by_agent"]["quality"]["usd"] == 0.0
+    assert data["by_agent"]["quality"]["unpriced_calls"] == 1
+    assert data["by_agent"]["kai"]["unpriced_calls"] == 0
+
+
 def test_cost_mixed_agent_and_total_show_priced_sum_plus_na(tmp_path):
     """Finding 2: an agent mixing a priced and an unpriced call shows its
     priced sum plus a `+ n/a` marker, and the Total line (which also mixes

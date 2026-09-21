@@ -95,6 +95,7 @@ def cost_command(
     # aggregate unpriced spend per model so it can be surfaced instead of
     # silently rendering as `$0.00`.
     agent_priced_flags: dict[str, dict[str, bool]] = {}
+    agent_unpriced_calls: dict[str, int] = {}
     unpriced_by_model: dict[str, dict[str, int]] = {}
     for r in by_model_rows:
         agent = r["agent"]
@@ -104,12 +105,19 @@ def cost_command(
             flags["has_priced"] = True
         else:
             flags["has_unpriced"] = True
+            agent_unpriced_calls[agent] = agent_unpriced_calls.get(agent, 0) + int(r["calls"])
             model_stats = unpriced_by_model.setdefault(
                 model, {"calls": 0, "input_tokens": 0, "output_tokens": 0}
             )
             model_stats["calls"] += int(r["calls"])
             model_stats["input_tokens"] += int(r["in_tok"])
             model_stats["output_tokens"] += int(r["out_tok"])
+
+    # Every agent row carries its unpriced-call count explicitly (0 when
+    # none), so `usd: 0.0` for an all-unpriced agent can never be misread as
+    # "this agent is free" by a machine reader that only looks at `usd`.
+    for agent, row in by_agent.items():
+        row["unpriced_calls"] = agent_unpriced_calls.get(agent, 0)
 
     if json_output:
         payload = {
