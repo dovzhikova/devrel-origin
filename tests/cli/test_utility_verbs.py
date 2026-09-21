@@ -46,7 +46,10 @@ def _seed_costs(tmp_path, rows):
                 "VALUES (?, ?, ?, ?, 0, 0, ?)",
                 (
                     r["agent"],
-                    r.get("model", "claude-sonnet-4-6"),
+                    # A real priced model id (MODEL_COSTS has no entry for the
+                    # bare "claude-sonnet-4-6" config default), so these rows
+                    # read as priced under devrel cost's is_priced check.
+                    r.get("model", "claude-sonnet-4-5-20250929"),
                     r.get("input", 100),
                     r.get("output", 50),
                     r["usd"],
