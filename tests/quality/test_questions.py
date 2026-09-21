@@ -18,6 +18,14 @@ def test_every_criterion_is_a_concrete_definition_not_a_bare_label():
             assert len(definition.split()) >= 4, name
 
 
+def test_binary_contrast_excludes_informative_contrast():
+    # v2 wording: an honest technical distinction is not the rhetorical device.
+    definition = q.PATTERN.criteria["binary_contrast"]
+    assert "straw man" in definition
+    assert "Not this pattern" in definition
+    assert q.QUESTION_VERSION == 2
+
+
 def test_questions_module_does_not_import_the_optional_sdk():
     src = q.__file__ or ""
     assert src.endswith("questions.py")

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-QUESTION_VERSION = 1
+QUESTION_VERSION = 2
 
 PATTERN_NONE = "none"
 
@@ -58,8 +58,11 @@ PATTERN = ChoiceSpec(
             "The passage states its point plainly and exhibits none of the other patterns"
         ),
         "binary_contrast": (
-            "Sets up a negation to deliver the point, such as It is not X, it is Y, or "
-            "The question is not X but Y"
+            "Uses a negation as a rhetorical setup for the point, such as It is not X, "
+            "it is Y, or The question is not X but Y, where the negated X is a straw "
+            "man added for emphasis rather than a claim anyone was making. Not this "
+            "pattern: a factual or technical distinction that corrects a specific, "
+            "plausible misreading or states a real limit of scope"
         ),
         "throat_clearing": (
             "Opens with a filler move before the point, such as Here is the thing, "
