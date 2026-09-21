@@ -27,6 +27,7 @@ from devrel_origin.quality.grounding import (
     _cut_flagged,
     _kb_candidates,
     _repo_facts_to_sources,
+    _split_sentences,
     ground_claims,
 )
 from devrel_origin.quality.judgments import UNAVAILABLE, NullJudge
@@ -171,12 +172,16 @@ async def test_ground_claims_cut_removes_unsourced(tmp_path):
 @pytest.mark.asyncio
 async def test_ground_claims_no_claims_is_noop(tmp_path):
     kb = _kb(tmp_path)
-    judge = FakeJudge()
+    # A real judgment that "Hello." is not a factual claim (prob 0.0), not a
+    # dropped-for-being-short sentence: the request was made and answered.
+    judge = FakeJudge(claim_probs=[0.0])
     result = await ground_claims(text="Hello.", kb=kb, judge=judge)
     assert result.total_claims == 0
     assert result.grounded_claims == 0
     assert result.flagged == []
     assert result.text_after == "Hello."
+    assert result.judged is True
+    assert result.backend == "typesafe"
 
 
 @pytest.mark.asyncio
@@ -472,3 +477,87 @@ async def test_haiku_unparseable_extraction_is_not_judged(tmp_path):
     )
     assert "PASS" not in render
     assert "SKIPPED" in render
+
+
+# --- FINAL RE-REVIEW part A: short claims and empty-candidate fallback -----
+
+
+def test_split_sentences_keeps_short_claims():
+    # A short CTA line is still a claim; nothing drops it for being few
+    # words (probeA's "Ship 10x faster." scenario).
+    assert _split_sentences("Ship 10x faster.") == ["Ship 10x faster."]
+
+
+def test_split_sentences_excludes_headings_and_fenced_code():
+    text = (
+        "# Why Acme\n\n"
+        "Acme builds 10x faster than webpack.\n\n"
+        "```\nconst x = 10;\n```\n\n"
+        "Install it today.\n"
+    )
+    assert _split_sentences(text) == [
+        "Acme builds 10x faster than webpack.",
+        "Install it today.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_short_cta_is_actually_judged():
+    # A real select_claims request must be made for a short claim, and its
+    # positive verdict must reach the flagged/grounded pipeline, not be
+    # silently dropped for being short.
+    judge = FakeJudge(claim_probs=[1.0])
+    result = await ground_claims(text="Ship 10x faster.", kb=_EmptyKB(), judge=judge)
+    assert result.total_claims == 1
+    assert result.backend == "typesafe"
+    assert len(result.flagged) == 1
+    assert result.flagged[0].claim.text == "Ship 10x faster."
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_heading_only_text_falls_back_to_haiku():
+    # Non-empty text whose only content is a heading yields zero candidate
+    # sentences on the typed path: that is not a judgment, so it must fall
+    # through to Haiku rather than render "0/0, judged by typesafe".
+    client = _haiku_client("[]", [])
+    judge = FakeJudge()  # available=True; would render a fake pass if asked
+    result = await ground_claims(text="# Why Acme", kb=_EmptyKB(), judge=judge, llm_client=client)
+    assert result.backend == "haiku"
+    assert result.judged is True
+    assert not judge.claims_seen
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_heading_only_text_without_llm_client_is_not_judged():
+    judge = FakeJudge()
+    result = await ground_claims(text="# Why Acme", kb=_EmptyKB(), judge=judge)
+    assert result.judged is False
+    assert result.backend == "none"
+    render = render_pr_summary(
+        build_provenance(content_type="blog_post", stages=[], grounding=result.to_dict())
+    )
+    assert "PASS" not in render
+
+
+# --- FINAL RE-REVIEW part A: cutting never removes adjacent lines ----------
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_cut_never_removes_adjacent_heading_or_bullets():
+    text = (
+        "# Why Acme\n\n"
+        "- Zero config setup\n"
+        "- Works with every framework\n"
+        "- Acme builds 10x faster than webpack.\n\n"
+        "Install it today and see for yourself.\n"
+    )
+    judge = FakeJudge(claim_probs=[0.0, 0.0, 1.0, 0.0], relations=[("contradicts", 0.9)])
+
+    result = await ground_claims(text=text, kb=_EmptyKB(), judge=judge, cut_unsourced=True)
+
+    assert result.cut_applied is True
+    assert "# Why Acme" in result.text_after
+    assert "- Zero config setup" in result.text_after
+    assert "- Works with every framework" in result.text_after
+    assert "Install it today and see for yourself." in result.text_after
+    assert "10x faster than webpack" not in result.text_after

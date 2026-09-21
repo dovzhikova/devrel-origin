@@ -121,12 +121,36 @@ def _grounded_claim_dict(gc: GroundedClaim) -> dict:
 
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_HEADING_RE = re.compile(r"^#{1,6}\s")
+_FENCE_RE = re.compile(r"^(```|~~~)")
 
 
 def _split_sentences(text: str) -> list[str]:
-    """Deterministic split. No model: a sentence boundary is not a judgment."""
-    parts = [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
-    return [p for p in parts if len(p.split()) >= 4]
+    """Deterministic split: first by line, then by sentence punctuation
+    within each remaining line. No model: a boundary is not a judgment.
+
+    A short claim is still a claim: nothing here drops a candidate for being
+    few words, so a CTA line like "Ship 10x faster." is judged like any
+    other. Splitting at the line level first also excludes markdown
+    headings and fenced code blocks outright (a heading is a label, not an
+    assertion, and code is not prose), and it keeps each candidate an exact,
+    isolated substring of the source, so a later cut of one flagged claim
+    can never consume an adjacent heading or bullet.
+    """
+    candidate_lines: list[str] = []
+    in_fence = False
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or _HEADING_RE.match(line):
+            continue
+        candidate_lines.append(line)
+    parts: list[str] = []
+    for line in candidate_lines:
+        parts.extend(s.strip() for s in _SENTENCE_RE.split(line) if s.strip())
+    return parts
 
 
 _EXTRACT_SYSTEM = (
@@ -401,26 +425,31 @@ async def ground_claims(
 
     if judge.available:
         sentences = _split_sentences(text)
-        probs = await judge.select_claims(sentences=sentences)
-        if probs is not None:
-            backend = "typesafe"
-            claims = [
-                Claim(text=s, kind="fact")
-                for s, p in zip(sentences, probs, strict=True)
-                if p >= CLAIM_PROB_MIN
-            ]
-            for claim in claims:
-                candidates = _kb_candidates(claim, kb) + repo_sources
-                bucket, gc = await _verify(claim, candidates, judge, confidence_min)
-                if bucket == "grounded":
-                    grounded.append(gc)
-                elif bucket == "skipped":
-                    skipped.append(gc)
-                else:
-                    flagged.append(gc)
-        # else: the typed claim selector failed entirely (any request error).
-        # That is not "zero claims": fall through to Haiku (spec order:
-        # TypeSafe, else Haiku, else skipped), never treat it as a pass.
+        if sentences:
+            probs = await judge.select_claims(sentences=sentences)
+            if probs is not None:
+                backend = "typesafe"
+                claims = [
+                    Claim(text=s, kind="fact")
+                    for s, p in zip(sentences, probs, strict=True)
+                    if p >= CLAIM_PROB_MIN
+                ]
+                for claim in claims:
+                    candidates = _kb_candidates(claim, kb) + repo_sources
+                    bucket, gc = await _verify(claim, candidates, judge, confidence_min)
+                    if bucket == "grounded":
+                        grounded.append(gc)
+                    elif bucket == "skipped":
+                        skipped.append(gc)
+                    else:
+                        flagged.append(gc)
+            # else: the typed claim selector failed entirely (any request
+            # error). That is not "zero claims": fall through to Haiku (spec
+            # order: TypeSafe, else Haiku, else skipped), never a pass.
+        # else: a non-empty text with zero candidate sentences (e.g. only
+        # headings or code) is also not a judgment: no request was made, so
+        # it must not render "0/0, judged by typesafe". Fall through exactly
+        # like a selector failure, never a silent typed-backend pass.
 
     if backend is None and llm_client is not None:
         backend = "haiku"
