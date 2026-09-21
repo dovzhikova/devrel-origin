@@ -93,13 +93,19 @@ class _FakeUsageJudge:
 
     async def verify_claim(self, *, claim: str, evidence: str) -> ClaimVerdict:
         self.last_usage = self._usages.pop(0)
-        return ClaimVerdict(relation="supports", confidence=1.0, available=True, backend=self.backend)
+        return ClaimVerdict(
+            relation="supports", confidence=1.0, available=True, backend=self.backend
+        )
 
     async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:
         self.last_usage = self._usages.pop(0)
         return [
             PatternVerdict(
-                unit_index=i, pattern=PATTERN_NONE, confidence=0.0, available=True, backend=self.backend
+                unit_index=i,
+                pattern=PATTERN_NONE,
+                confidence=0.0,
+                available=True,
+                backend=self.backend,
             )
             for i, _ in enumerate(units)
         ]

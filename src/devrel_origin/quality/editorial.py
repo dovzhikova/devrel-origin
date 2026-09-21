@@ -30,7 +30,7 @@ from typing import Any
 
 from devrel_origin.project.paths import ProjectPaths
 from devrel_origin.quality.grounding import GroundingResult, ground_claims
-from devrel_origin.quality.judgments import Judge, build_judge
+from devrel_origin.quality.judgments import Judge, build_judge, with_cost_sink
 from devrel_origin.quality.persona import test_against_persona
 from devrel_origin.quality.provenance import build_provenance
 from devrel_origin.quality.readability import check_against_target, compute_readability
@@ -310,6 +310,12 @@ async def run_pipeline(
         else ""
     )
     judge = build_judge()
+    if project_paths.state_db.is_file():
+        # Imports core.llm (via project.cost_sink), which imports this module
+        # through core/kai.py, so a top-level import here would cycle.
+        from devrel_origin.project.cost_sink import make_sqlite_sink
+
+        judge = with_cost_sink(judge, make_sqlite_sink(project_paths.state_db))
 
     # Fail-fast on unknown content_type before any LLM spend.
     get_targets(content_type, style_md)
