@@ -1,13 +1,18 @@
 """Tests for the grounding stage (quality/grounding.py).
 
-Grounding splits the draft into sentences deterministically, selects claims
-and verifies them through the typed judgment port (``Judge``), then retrieves
-KB + repo candidate sources. The KB is a real TF-IDF index over a tmp
-directory. No network, no real APIs: every judgment comes from ``FakeJudge``
-or ``NullJudge``.
+Grounding tries the typed judgment port (``Judge``) first: sentences are split
+deterministically, then claims are selected and verified through ``Judge``.
+When no typed judge is available, it falls back to Haiku (``llm_client``):
+claims are extracted and adjudicated via two prompted calls per claim. With
+neither backend, the stage does not run. KB + repo candidate retrieval is
+shared and deterministic across both backends. The KB is a real TF-IDF index
+over a tmp directory. No network, no real APIs: every judgment comes from
+``FakeJudge``, ``NullJudge``, or a scripted fake ``llm_client``.
 """
 
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,6 +22,8 @@ from devrel_origin.quality.grounding import (
     GroundedClaim,
     GroundingResult,
     Source,
+    _coerce_adjudication,
+    _coerce_claims,
     _cut_flagged,
     _kb_candidates,
     _repo_facts_to_sources,
@@ -24,6 +31,22 @@ from devrel_origin.quality.grounding import (
 )
 from devrel_origin.quality.judgments import UNAVAILABLE, NullJudge
 from tests.quality.fakes import FakeJudge
+
+
+def _haiku_client(extract_json: str, adjudications: list[str]):
+    """LLM mock: first call is extraction, subsequent calls are adjudications."""
+    client = MagicMock()
+    adj_iter = iter(adjudications)
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "extract discrete" in system_prompt:
+            return extract_json
+        if "fact-checker" in system_prompt:
+            return next(adj_iter)
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+    return client
 
 
 def _kb(tmp_path):
@@ -233,3 +256,133 @@ async def test_without_a_judge_the_stage_is_skipped_never_grounded():
     assert result.grounded_claims == 0
     assert result.flagged == []
     assert result.text_after == "The release adds a queue."
+    assert result.backend == "none"
+
+
+# --- restored from the pre-Task-5 Haiku path (723d270) ----------------------
+
+
+def test_coerce_claims_parses_json_list():
+    raw = (
+        '[{"text": "cuts build time 40%", "kind": "metric"}, '
+        '{"text": "supports OTel", "kind": "capability"}]'
+    )
+    claims = _coerce_claims(raw)
+    assert len(claims) == 2
+    assert claims[0].kind == "metric"
+    assert claims[1].text == "supports OTel"
+
+
+def test_coerce_claims_tolerates_fences_and_junk():
+    assert _coerce_claims("```json\nnot json\n```") == []
+    assert _coerce_claims("total garbage") == []
+    assert _coerce_claims('{"not": "a list"}') == []
+
+
+def test_coerce_claims_defaults_unknown_kind_to_fact():
+    claims = _coerce_claims('[{"text": "x", "kind": "weird"}]')
+    assert claims[0].kind == "fact"
+
+
+def test_coerce_adjudication_grounded_requires_cited_source():
+    candidates = _repo_facts_to_sources([{"ref": "commit:abc", "excerpt": "shipped OTel"}])
+    # Grounded but no source_indexes -> downgraded to not grounded.
+    grounded, picked, _ = _coerce_adjudication(
+        '{"grounded": true, "source_indexes": [], "reason": "ok"}', candidates
+    )
+    assert grounded is False
+    assert picked == []
+
+
+def test_coerce_adjudication_picks_valid_sources():
+    candidates = _repo_facts_to_sources(
+        [
+            {"ref": "commit:abc", "excerpt": "shipped OTel"},
+            {"ref": "repo_stats", "excerpt": "100 stars"},
+        ]
+    )
+    grounded, picked, reason = _coerce_adjudication(
+        '{"grounded": true, "source_indexes": [1], "reason": "stat matches"}', candidates
+    )
+    assert grounded is True
+    assert len(picked) == 1
+    assert picked[0].ref == "repo_stats"
+    assert reason == "stat matches"
+
+
+# --- Task 5b: Haiku fallback -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_haiku_path_runs_when_judge_unavailable(tmp_path):
+    kb = _kb(tmp_path)
+    extract = (
+        '[{"text": "auto-instruments for OpenTelemetry", "kind": "capability"},'
+        ' {"text": "used by NASA", "kind": "fact"}]'
+    )
+    adj = [
+        '{"grounded": true, "source_indexes": [0], "reason": "kb states it"}',
+        '{"grounded": false, "source_indexes": [], "reason": "no source"}',
+    ]
+    client = _haiku_client(extract, adj)
+
+    result = await ground_claims(text="draft text", kb=kb, judge=NullJudge(), llm_client=client)
+
+    assert result.backend == "haiku"
+    assert result.judged is True
+    assert result.total_claims == 2
+    assert result.grounded_claims == 1
+    assert len(result.flagged) == 1
+    assert result.flagged[0].claim.text == "used by NASA"
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_preferred_over_llm_client_when_available(tmp_path):
+    kb = _kb(tmp_path)
+    judge = FakeJudge(relations=[("supports", 0.9)])
+    client = _haiku_client("[]", [])
+
+    result = await ground_claims(
+        text="The agent auto-instruments applications for OpenTelemetry with zero code changes.",
+        kb=kb,
+        judge=judge,
+        llm_client=client,
+    )
+
+    assert result.backend == "typesafe"
+    client.generate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_backend_at_all_reports_none(tmp_path):
+    kb = _kb(tmp_path)
+    result = await ground_claims(text="Hello there world today.", kb=kb, judge=NullJudge())
+    assert result.judged is False
+    assert result.backend == "none"
+
+
+@pytest.mark.asyncio
+async def test_haiku_unparseable_adjudication_is_skipped_not_flagged_and_still_cut_safe(tmp_path):
+    kb = _kb(tmp_path)
+    text = "Great tool. Used by NASA. Ships fast."
+    extract = '[{"text": "Used by NASA.", "kind": "fact"}]'
+    adj = ["not valid json at all"]
+    client = _haiku_client(extract, adj)
+    # A candidate must exist so `_adjudicate` actually calls the LLM instead
+    # of short-circuiting on "no candidate sources".
+    repo_facts = [{"ref": "commit:abc", "excerpt": "NASA is a reference customer"}]
+
+    result = await ground_claims(
+        text=text,
+        kb=kb,
+        judge=NullJudge(),
+        llm_client=client,
+        cut_unsourced=True,
+        repo_facts=repo_facts,
+    )
+
+    assert result.flagged == []
+    assert len(result.skipped) == 1
+    assert result.skipped[0].claim.text == "Used by NASA."
+    assert result.cut_applied is False
+    assert "Used by NASA." in result.text_after
