@@ -1,9 +1,15 @@
 """Anti-slop pipeline stage 5.
 
-Three-step matching:
+Regex tier plus one of two second tiers:
 1. Regex blocklist (deterministic, fast). Word-boundary, case-insensitive.
-2. LLM lint (Haiku). Catches context-sensitive slop the regex misses
-   (verbose intros, vague intensifiers in unusual phrasings).
+2a. Typed patterns (a judgment backend). Each unit (paragraph) gets one
+    probability per named pattern (`quality.judgments.PatternVerdict`);
+    `find_patterns` flags a unit when any pattern clears its own calibrated
+    threshold (`quality.questions.PATTERN_THRESHOLDS`) and names the highest
+    of the patterns that did.
+2b. LLM lint (Haiku), the degraded path when no judgment backend is
+    available. Catches context-sensitive slop the regex misses (verbose
+    intros, vague intensifiers in unusual phrasings).
 3. Force-rewrite (Sonnet). One targeted rewrite call with all hits listed.
    If the rewrite still trips the blocklist on re-check, the orchestrator
    aborts loud, see editorial.py.
@@ -22,6 +28,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+
+from devrel_origin.quality.judgments import PatternVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +51,57 @@ def parse_blocklist(md: str) -> list[str]:
             continue
         out.append(line.lower())
     return out
+
+
+@dataclass(frozen=True)
+class PatternHit:
+    unit_index: int
+    unit_text: str
+    pattern: str
+    confidence: float
+
+
+def split_units(text: str) -> list[str]:
+    """Paragraphs, because a pattern such as a recap ending spans sentences."""
+    return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+
+def find_patterns(
+    text: str, verdicts: list[PatternVerdict], thresholds: dict[str, float]
+) -> list[PatternHit]:
+    """A unit is a hit if any pattern's probability is at or above that
+    pattern's own threshold. The hit names the flagged pattern with the
+    highest probability among those that cleared their own threshold, which
+    is not necessarily the unit's single highest-probability pattern (a
+    pattern with a lower raw probability can still be the one that clears,
+    when its threshold is lower than a higher-probability pattern's).
+
+    An unavailable verdict, or one that carries no per-pattern
+    probabilities (the NullJudge / degraded case), is never a hit."""
+    units = split_units(text)
+    hits: list[PatternHit] = []
+    for v in verdicts:
+        if not v.available or not v.probabilities:
+            continue
+        if v.unit_index >= len(units):
+            continue
+        cleared = {
+            pattern: prob
+            for pattern, prob in v.probabilities.items()
+            if prob >= thresholds.get(pattern, 1.01)
+        }
+        if not cleared:
+            continue
+        best_pattern = max(cleared, key=cleared.get)
+        hits.append(
+            PatternHit(
+                unit_index=v.unit_index,
+                unit_text=units[v.unit_index],
+                pattern=best_pattern,
+                confidence=cleared[best_pattern],
+            )
+        )
+    return hits
 
 
 def find_slop(text: str, blocklist: list[str]) -> list[SlopHit]:
@@ -144,21 +203,43 @@ _REWRITE_SYSTEM = (
 async def force_rewrite(
     text: str,
     regex_hits: list[SlopHit],
-    llm_lint_hits: list[str],
+    flagged_hits: list[PatternHit] | list[str],
     voice: str,
     llm_client,
 ) -> str:
     """Single Sonnet rewrite with the full flagged list. Caller is
-    responsible for re-running `find_slop` + `llm_lint` to verify the
-    rewrite cleared the issues."""
-    flagged = sorted({h.phrase for h in regex_hits} | set(llm_lint_hits))
-    flagged_listing = "\n".join(f"- {p}" for p in flagged)
-    user = (
-        "Voice contract:\n\n" + (voice or "(none)") + "\n\n"
-        "Flagged phrases (do not let any of these appear in the rewrite, "
-        "and avoid close synonyms):\n\n" + flagged_listing + "\n\n"
-        "Original content:\n\n" + text
-    )
+    responsible for re-checking the rewrite cleared the issues (re-running
+    `find_slop` plus either `find_patterns` or `llm_lint`, matching whichever
+    tier produced `flagged_hits`).
+
+    `flagged_hits` is `list[PatternHit]` on the typed-judge path (each named
+    pattern is listed with its quoted passage, so the rewrite can target the
+    exact text) or `list[str]` on the llm_lint path (merged into the same
+    flat phrase listing as `regex_hits`, unchanged from before the typed
+    judge existed)."""
+    is_pattern_hits = any(isinstance(h, PatternHit) for h in flagged_hits)
+    if is_pattern_hits:
+        flagged_listing = "\n".join(f"- {p}" for p in sorted({h.phrase for h in regex_hits}))
+        pattern_listing = "\n".join(
+            f"- {h.pattern} in this passage:\n  {h.unit_text}" for h in flagged_hits
+        )
+        user = (
+            "Voice contract:\n\n" + (voice or "(none)") + "\n\n"
+            "Flagged phrases (do not let any of these appear in the rewrite, "
+            "and avoid close synonyms):\n\n" + flagged_listing + "\n\n"
+            "Flagged patterns (rewrite these passages so the named pattern "
+            "no longer appears):\n\n" + pattern_listing + "\n\n"
+            "Original content:\n\n" + text
+        )
+    else:
+        flagged = sorted({h.phrase for h in regex_hits} | set(flagged_hits))
+        flagged_listing = "\n".join(f"- {p}" for p in flagged)
+        user = (
+            "Voice contract:\n\n" + (voice or "(none)") + "\n\n"
+            "Flagged phrases (do not let any of these appear in the rewrite, "
+            "and avoid close synonyms):\n\n" + flagged_listing + "\n\n"
+            "Original content:\n\n" + text
+        )
     rewritten = await llm_client.generate(
         system_prompt=_REWRITE_SYSTEM,
         user_prompt=user,
