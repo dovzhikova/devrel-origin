@@ -82,6 +82,13 @@ geo-google = [
     "google-search-results>=2.4.2",
 ]
 
+# Typed judgments for the anti-slop and grounding gates (TypeSafe System One).
+# Without this extra (or without TYPESAFE_API_KEY) the gates fall back to the
+# deterministic regex blocklist and report themselves as skipped.
+typesafe = [
+    "typesafe-sdk>=0.7.0,<0.8.0",
+]
+
 # Convenience: full Growth pipeline (Selene + Vega + Cyra). GEO + CRO have
 # zero new deps; their AI clients reuse existing openai/anthropic/httpx.
 growth = [

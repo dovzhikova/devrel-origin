@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from devrel_origin.quality.judgments import ClaimVerdict, NullJudge, build_judge
+from devrel_origin.quality.questions import PATTERN_NONE
 
 
 @pytest.mark.asyncio
@@ -23,6 +24,7 @@ async def test_null_judge_returns_one_unavailable_verdict_per_unit():
     verdicts = await NullJudge().judge_patterns(units=["a", "b", "c"], voice="")
     assert [v.unit_index for v in verdicts] == [0, 1, 2]
     assert all(v.available is False for v in verdicts)
+    assert all(v.pattern == PATTERN_NONE for v in verdicts)
 
 
 @pytest.mark.asyncio
@@ -48,6 +50,17 @@ def test_build_judge_never_raises(monkeypatch):
 
     monkeypatch.setenv("TYPESAFE_API_KEY", "sk-test")
     monkeypatch.setattr("devrel_origin.quality.judgments._sdk_available", boom)
+    assert build_judge().backend == "none"
+
+
+def test_build_judge_falls_back_when_the_backend_constructor_raises(monkeypatch):
+    class _Boom:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("client construction exploded")
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "sk-test")
+    monkeypatch.setattr("devrel_origin.quality.judgments._sdk_available", lambda: True)
+    monkeypatch.setattr("devrel_origin.quality.judgments_typesafe.TypeSafeJudge", _Boom)
     assert build_judge().backend == "none"
 
 
