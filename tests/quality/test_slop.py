@@ -91,6 +91,9 @@ def test_very_and_really_stay_in_tier_one_since_tier_two_was_never_built():
 
 
 def test_tier_one_additions_from_no_ai_slop_are_present():
+    # "harness" and "robust" are excluded (FINAL RE-REVIEW part B, Important):
+    # they are ordinary technical vocabulary in DevRel prose ("test harness",
+    # "robust error handling") and would force rewrites/aborts on real text.
     from pathlib import Path
 
     md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
@@ -101,7 +104,6 @@ def test_tier_one_additions_from_no_ai_slop_are_present():
         "utilize",
         "facilitate",
         "streamline",
-        "robust",
         "cutting-edge",
         "paradigm shift",
         "game changer",
@@ -115,10 +117,11 @@ def test_tier_one_additions_from_no_ai_slop_are_present():
         "elevate",
         "embark",
         "supercharge",
-        "harness",
         "ever-evolving",
     }
     assert added <= entries
+    assert "harness" not in entries
+    assert "robust" not in entries
 
 
 def test_mit_credit_line_present():

@@ -33,7 +33,6 @@ leverage
 utilize
 facilitate
 streamline
-robust
 cutting-edge
 paradigm shift
 game changer
@@ -47,7 +46,6 @@ transformative
 elevate
 embark
 supercharge
-harness
 ever-evolving
 
 ## Generic CTAs
