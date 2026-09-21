@@ -33,8 +33,16 @@ from devrel_origin.quality.grounding import GroundingResult, ground_claims
 from devrel_origin.quality.judgments import Judge, build_judge, with_cost_sink
 from devrel_origin.quality.persona import test_against_persona
 from devrel_origin.quality.provenance import build_provenance
+from devrel_origin.quality.questions import PATTERN_THRESHOLDS
 from devrel_origin.quality.readability import check_against_target, compute_readability
-from devrel_origin.quality.slop import find_slop, force_rewrite, llm_lint, parse_blocklist
+from devrel_origin.quality.slop import (
+    find_patterns,
+    find_slop,
+    force_rewrite,
+    llm_lint,
+    parse_blocklist,
+    split_units,
+)
 from devrel_origin.quality.style import get_targets, load_style
 from devrel_origin.quality.voice import load_voice
 
@@ -146,32 +154,62 @@ async def _slop_stage(
     blocklist: list[str],
     voice: str,
     llm_client,
+    judge: Judge,
 ) -> tuple[str, StageResult]:
+    """Regex tier plus either the typed pattern judge or llm_lint.
+
+    `judge.available` picks the backend: with one, the stage runs the typed
+    per-pattern path (calibrated thresholds, quoted passages). Without one,
+    it falls back to the llm_lint path exactly as it behaved before the
+    typed judge existed, so a project without the extra sees no regression.
+    """
     t0 = time.monotonic()
-    regex_hits = find_slop(text_before, blocklist)
-    lint_hits = await llm_lint(text_before, voice, llm_client)
-    if not regex_hits and not lint_hits:
+    use_typed = judge.available
+
+    async def _check(text: str):
+        regex_hits = find_slop(text, blocklist)
+        if use_typed:
+            verdicts = await judge.judge_patterns(units=split_units(text), voice=voice)
+            return regex_hits, find_patterns(text, verdicts, PATTERN_THRESHOLDS)
+        return regex_hits, await llm_lint(text, voice, llm_client)
+
+    regex_hits, slop_hits = await _check(text_before)
+    if not regex_hits and not slop_hits:
+        detail = f"clean (judged_by={judge.backend})" if use_typed else "clean"
         return text_before, StageResult(
             name="anti_slop",
             text_before=text_before,
             text_after=text_before,
             duration_s=round(time.monotonic() - t0, 3),
-            detail="clean",
+            detail=detail,
         )
-    rewritten = await force_rewrite(text_before, regex_hits, lint_hits, voice, llm_client)
+
+    rewritten = await force_rewrite(text_before, regex_hits, slop_hits, voice, llm_client)
     # Re-check after rewrite.
-    re_regex = find_slop(rewritten, blocklist)
-    re_lint = await llm_lint(rewritten, voice, llm_client)
-    if re_regex or re_lint:
-        offenders = sorted({h.phrase for h in re_regex} | set(re_lint))
+    re_regex, re_slop = await _check(rewritten)
+    if re_regex or re_slop:
+        if use_typed:
+            offenders = sorted({h.phrase for h in re_regex} | {h.pattern for h in re_slop})
+        else:
+            offenders = sorted({h.phrase for h in re_regex} | set(re_slop))
         raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
+
+    if use_typed:
+        issues = sorted({h.phrase for h in regex_hits}) + [
+            f"{h.pattern}: {h.unit_text[:60]}" for h in slop_hits
+        ]
+        detail = f"rewrite_applied (judged_by={judge.backend})"
+    else:
+        issues = sorted({h.phrase for h in regex_hits} | set(slop_hits))
+        detail = "rewrite_applied"
+
     return rewritten, StageResult(
         name="anti_slop",
         text_before=text_before,
         text_after=rewritten,
         duration_s=round(time.monotonic() - t0, 3),
-        issues=sorted({h.phrase for h in regex_hits} | set(lint_hits)),
-        detail="rewrite_applied",
+        issues=issues,
+        detail=detail,
     )
 
 
@@ -364,6 +402,7 @@ async def run_pipeline(
         blocklist=blocklist,
         voice=voice,
         llm_client=llm_client,
+        judge=judge,
     )
     stages.append(sr)
 
@@ -404,6 +443,7 @@ async def run_pipeline(
             blocklist=blocklist,
             voice=voice,
             llm_client=llm_client,
+            judge=judge,
         )
         stages.append(sr)
 

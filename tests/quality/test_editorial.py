@@ -7,11 +7,58 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from devrel_origin.project.paths import ProjectPaths
+from devrel_origin.quality import editorial
 from devrel_origin.quality.editorial import (
     AbortLoud,
     EditorialResult,
     run_pipeline,
 )
+from devrel_origin.quality.judgments import PatternVerdict
+from devrel_origin.quality.questions import PATTERN_NONE
+
+
+class _ScriptedPatternJudge:
+    """A judge whose `judge_patterns` answers change between calls, so a test
+    can script "flagged on the first check, clean on the re-check after
+    rewrite" the way a real judge's answer would change once the rewrite
+    removed the pattern."""
+
+    available = True
+    backend = "fake"
+
+    def __init__(self, responses: list[dict[int, tuple[str, float]]]):
+        # Each entry maps unit_index -> (pattern, probability) for one call,
+        # consumed in order; extra calls beyond the scripted list see none.
+        self._responses = list(responses)
+
+    async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:
+        spec = self._responses.pop(0) if self._responses else {}
+        out = []
+        for i, _ in enumerate(units):
+            if i in spec:
+                pattern, prob = spec[i]
+                out.append(
+                    PatternVerdict(
+                        unit_index=i,
+                        pattern=pattern,
+                        confidence=prob,
+                        available=True,
+                        backend=self.backend,
+                        probabilities={pattern: prob},
+                    )
+                )
+            else:
+                out.append(
+                    PatternVerdict(
+                        unit_index=i,
+                        pattern=PATTERN_NONE,
+                        confidence=0.0,
+                        available=True,
+                        backend=self.backend,
+                        probabilities=None,
+                    )
+                )
+        return out
 
 
 def _project(tmp_path) -> ProjectPaths:
@@ -159,6 +206,94 @@ async def test_slop_persists_after_rewrite_aborts_loud(tmp_path):
             llm_client=client,
         )
     assert "delve" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_clean_run_names_the_backend_in_detail(tmp_path, monkeypatch):
+    judge = _ScriptedPatternJudge(responses=[{}])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = _mock_client_for_clean_run()
+
+    result = await run_pipeline(
+        initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+    )
+    slop_stage = next(s for s in result.stages if s.name == "anti_slop")
+    assert slop_stage.detail == "clean (judged_by=fake)"
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_pattern_hit_triggers_force_rewrite_with_quoted_passage(
+    tmp_path, monkeypatch
+):
+    # First check flags unit 0 as faux_insight (0.9 clears its 0.30
+    # threshold); the re-check after rewrite comes back clean.
+    judge = _ScriptedPatternJudge(responses=[{0: ("faux_insight", 0.9)}, {}])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.set_agent = MagicMock()
+    client.generate_with_revision = AsyncMock(
+        return_value=(
+            "What nobody tells you: it ships.",
+            MagicMock(final_score=8, revision_rounds=0, critiques=[]),
+        )
+    )
+    rewrite_text = "It ships a ranked action queue."
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "skeptical senior backend developer" in system_prompt:  # persona
+            return '{"score": 8, "weak_sections": [], "feedback": "ok"}'
+        if "rewrite editor" in system_prompt:  # force_rewrite
+            assert "faux_insight" in user_prompt
+            assert "What nobody tells you: it ships." in user_prompt
+            return rewrite_text
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    result = await run_pipeline(
+        initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+    )
+    slop_stage = next(s for s in result.stages if s.name == "anti_slop")
+    assert slop_stage.detail == "rewrite_applied (judged_by=fake)"
+    assert any(i.startswith("faux_insight:") for i in slop_stage.issues)
+    # Captured right off the slop stage itself, so a later readability
+    # reloop (triggered by this short mock text, unrelated to slop) cannot
+    # confound what this test is checking.
+    assert slop_stage.text_after == rewrite_text
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_pattern_persists_after_rewrite_aborts_loud(tmp_path, monkeypatch):
+    judge = _ScriptedPatternJudge(
+        responses=[{0: ("faux_insight", 0.9)}, {0: ("faux_insight", 0.9)}]
+    )
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.set_agent = MagicMock()
+    client.generate_with_revision = AsyncMock(
+        return_value=(
+            "What nobody tells you: it ships.",
+            MagicMock(final_score=8, revision_rounds=0, critiques=[]),
+        )
+    )
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "skeptical senior backend developer" in system_prompt:
+            return '{"score": 8, "weak_sections": [], "feedback": "ok"}'
+        if "rewrite editor" in system_prompt:
+            return "What nobody tells you: it still ships."
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    with pytest.raises(AbortLoud) as exc_info:
+        await run_pipeline(
+            initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+        )
+    assert "faux_insight" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
