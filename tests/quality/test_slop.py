@@ -6,12 +6,17 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from devrel_origin.quality.judgments import PatternVerdict
+from devrel_origin.quality.questions import PATTERN_THRESHOLDS
 from devrel_origin.quality.slop import (
+    PatternHit,
     SlopHit,
+    find_patterns,
     find_slop,
     force_rewrite,
     llm_lint,
     parse_blocklist,
+    split_units,
 )
 
 
@@ -63,6 +68,68 @@ def test_find_slop_handles_multi_word_phrases():
 
 def test_find_slop_empty_when_no_matches():
     assert find_slop("Direct, sharp, no fluff.", ["delve", "tapestry"]) == []
+
+
+def test_the_shipped_template_contains_no_prose_entries():
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
+    entries = parse_blocklist(md)
+    assert entries, "template parsed to nothing"
+    long_entries = [e for e in entries if len(e.split()) > 6]
+    assert long_entries == [], f"prose ingested as blocklist entries: {long_entries}"
+
+
+def test_very_and_really_stay_in_tier_one_since_tier_two_was_never_built():
+    # Tier 2 (context-dependent intensifiers judged, not matched) was never
+    # built, so removing these would weaken the gate rather than sharpen it.
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
+    entries = set(parse_blocklist(md))
+    assert {"very", "really"} <= entries
+
+
+def test_tier_one_additions_from_no_ai_slop_are_present():
+    # "harness" and "robust" are excluded (FINAL RE-REVIEW part B, Important):
+    # they are ordinary technical vocabulary in DevRel prose ("test harness",
+    # "robust error handling") and would force rewrites/aborts on real text.
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
+    entries = set(parse_blocklist(md))
+    added = {
+        "foster",
+        "leverage",
+        "utilize",
+        "facilitate",
+        "streamline",
+        "cutting-edge",
+        "paradigm shift",
+        "game changer",
+        "realm",
+        "beacon",
+        "multifaceted",
+        "meticulous",
+        "intricate",
+        "paramount",
+        "transformative",
+        "elevate",
+        "embark",
+        "supercharge",
+        "ever-evolving",
+    }
+    assert added <= entries
+    assert "harness" not in entries
+    assert "robust" not in entries
+
+
+def test_mit_credit_line_present():
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
+    assert "petergyang/no-ai-slop" in md
+    assert "MIT" in md
 
 
 @pytest.mark.asyncio
@@ -146,3 +213,112 @@ async def test_force_rewrite_passes_hits_to_llm_and_returns_text():
     # Must list every flagged item in the rewrite prompt.
     assert "delve" in user_prompt
     assert "extra-slop" in user_prompt
+
+
+def test_units_are_paragraphs_so_the_quoted_line_is_locatable():
+    text = "First para line one.\nStill first.\n\nSecond para."
+    assert split_units(text) == ["First para line one.\nStill first.", "Second para."]
+
+
+def test_find_patterns_flags_a_unit_when_any_pattern_clears_its_own_threshold():
+    verdicts = [
+        PatternVerdict(
+            unit_index=0,
+            pattern="faux_insight",
+            confidence=0.42,
+            available=True,
+            backend="fake",
+            probabilities={"faux_insight": 0.42},
+        ),
+        PatternVerdict(
+            unit_index=1,
+            pattern="importance_puffery",
+            confidence=0.42,
+            available=True,
+            backend="fake",
+            probabilities={"importance_puffery": 0.42},
+        ),
+    ]
+    # faux_insight's threshold is 0.30 (clears at 0.42); importance_puffery's
+    # is 0.90 (0.42 does not clear it).
+    hits = find_patterns("a\n\nb", verdicts, PATTERN_THRESHOLDS)
+    assert [h.unit_index for h in hits] == [0]
+
+
+def test_find_patterns_names_the_highest_probability_pattern_that_cleared():
+    verdicts = [
+        PatternVerdict(
+            unit_index=0,
+            pattern="importance_puffery",
+            confidence=0.85,
+            available=True,
+            backend="fake",
+            probabilities={"importance_puffery": 0.85, "faux_insight": 0.75},
+        ),
+    ]
+    # importance_puffery has the higher raw probability (0.85) but its
+    # threshold is 0.90, so it never clears; faux_insight (0.75 >= 0.30)
+    # does, and is the only candidate, so it names the hit.
+    hits = find_patterns("a", verdicts, PATTERN_THRESHOLDS)
+    assert len(hits) == 1
+    assert hits[0].pattern == "faux_insight"
+    assert hits[0].confidence == 0.75
+
+
+def test_find_patterns_an_unavailable_verdict_is_never_a_hit():
+    # This proves find_patterns's own contract only: a unit whose verdict is
+    # unavailable never becomes a PatternHit. It says nothing about whether a
+    # stage built on top of this ever reports "clean" when unavailable
+    # verdicts are present: that is _slop_stage's job, covered separately in
+    # tests/quality/test_editorial.py.
+    verdicts = [
+        PatternVerdict(
+            unit_index=0, pattern="none", confidence=0.0, available=False, backend="none"
+        )
+    ]
+    assert find_patterns("a", verdicts, PATTERN_THRESHOLDS) == []
+
+
+def test_find_patterns_a_verdict_with_no_probabilities_is_never_a_hit():
+    # NullJudge and a scripted "clean" verdict never carry probabilities.
+    verdicts = [
+        PatternVerdict(unit_index=0, pattern="none", confidence=0.0, available=True, backend="x")
+    ]
+    assert find_patterns("a", verdicts, PATTERN_THRESHOLDS) == []
+
+
+def test_find_patterns_every_hit_carries_the_text_it_is_about():
+    verdicts = [
+        PatternVerdict(
+            unit_index=0,
+            pattern="faux_insight",
+            confidence=0.9,
+            available=True,
+            backend="fake",
+            probabilities={"faux_insight": 0.9},
+        )
+    ]
+    hits = find_patterns("What nobody tells you: it ships.", verdicts, PATTERN_THRESHOLDS)
+    assert hits[0].unit_text == "What nobody tells you: it ships."
+    # The model never returned this string; code located it. That is the point.
+
+
+@pytest.mark.asyncio
+async def test_force_rewrite_with_pattern_hits_quotes_the_flagged_passage():
+    client = MagicMock()
+    client.generate = AsyncMock(return_value="the rewritten text")
+    regex_hits = [SlopHit(phrase="delve", start=0, end=5)]
+    pattern_hits = [
+        PatternHit(
+            unit_index=0,
+            unit_text="What nobody tells you: it ships.",
+            pattern="faux_insight",
+            confidence=0.9,
+        )
+    ]
+    out = await force_rewrite("delve into x", regex_hits, pattern_hits, "voice", client)
+    assert out == "the rewritten text"
+    user_prompt = client.generate.await_args.kwargs["user_prompt"]
+    assert "delve" in user_prompt
+    assert "faux_insight" in user_prompt
+    assert "What nobody tells you: it ships." in user_prompt

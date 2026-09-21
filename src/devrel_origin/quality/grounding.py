@@ -11,14 +11,30 @@ gated behind ``ground=False`` by default because it adds latency and cost. Turn
 it on for hero / CTA / landing-page artifacts where an unsourced claim is
 expensive.
 
-Three steps, mirroring the anti-slop stage's shape:
-1. Extract discrete factual claims from the draft (one Haiku call, strict JSON).
-   Pure opinion / instructions / code are not claims and are skipped.
-2. For each claim, gather candidate evidence: KB search hits plus (optionally)
-   repo facts. This is deterministic retrieval, no LLM.
-3. Adjudicate each claim against its candidates (one Haiku call per claim):
-   does any candidate actually support it? Supported claims cite their source;
-   unsupported claims are flagged as unsourced.
+Backend selection, tried in this order:
+1. A typed judgment backend (``Judge.available`` is True): sentences are split
+   deterministically, claim selection and verification both go through the
+   typed judgment port (``Judge.select_claims`` / ``Judge.verify_claim``).
+   ``llm_client`` is not consulted while this path succeeds. If claim
+   selection itself fails entirely (``select_claims`` returns ``None``: any
+   request error, including a partial failure of a chunked call), that is
+   NOT "zero claims" and does not render a pass; it falls through to step 2.
+2. Otherwise (no typed judge, or its claim selection just failed), an
+   ``llm_client``: Haiku extracts claims and adjudicates each one against
+   candidate sources with two prompted calls per claim. If Haiku's own claim
+   extraction reply cannot be parsed, that is also NOT "zero claims"; the
+   draft is reported ``judged=False``, exactly like step 3.
+3. Otherwise: the stage does not run. It reports ``judged=False``, grounds
+   nothing, flags nothing, and leaves the text untouched.
+
+"Not judged" is a third state, distinct from "pass" and from "flagged," at
+both the per-claim and the per-draft level. A single claim can also come back
+unjudged even when the stage as a whole ran: a verdict can be unavailable for
+one call (a transient backend failure, or a Haiku reply that cannot be
+parsed) while the stage overall did run. That claim goes into
+``GroundingResult.skipped``, never into ``flagged``, and is never cut by
+``cut_unsourced`` (a skip is not evidence the claim is wrong; deleting it on
+a hiccup would be worse than leaving it flagged for a human).
 
 The output ``GroundingResult`` is JSON-serializable and feeds the provenance
 trail (see ``quality.provenance``).
@@ -28,13 +44,18 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
+
+from devrel_origin.quality.judgments import Judge
 
 if TYPE_CHECKING:
     from devrel_origin.core.base import KnowledgeBaseSearch
 
 logger = logging.getLogger(__name__)
+
+CLAIM_PROB_MIN = 0.5
 
 
 @dataclass(frozen=True)
@@ -42,7 +63,7 @@ class Claim:
     """A discrete factual assertion extracted from the draft."""
 
     text: str
-    kind: str  # "metric", "capability", "comparison", "fact"
+    kind: str  # "metric", "capability", "comparison", or "fact"
 
 
 @dataclass(frozen=True)
@@ -56,7 +77,7 @@ class Source:
 
 @dataclass
 class GroundedClaim:
-    """A claim after adjudication against candidate sources."""
+    """A claim after verification against candidate sources."""
 
     claim: Claim
     grounded: bool
@@ -70,10 +91,13 @@ class GroundingResult:
 
     total_claims: int
     grounded_claims: int
-    flagged: list[GroundedClaim]  # unsourced claims
+    flagged: list[GroundedClaim]  # unsourced or contradicted claims
     grounded: list[GroundedClaim]  # sourced claims (with citations)
     cut_applied: bool  # whether unsourced claims were removed from the text
     text_after: str
+    judged: bool = True  # False when no backend was available at all (stage-level)
+    skipped: list[GroundedClaim] = field(default_factory=list)  # per-claim: verdict unavailable
+    backend: str = "none"  # "typesafe", "haiku", or "none"
 
     def to_dict(self) -> dict:
         """JSON-serializable view for the provenance trail."""
@@ -81,15 +105,52 @@ class GroundingResult:
             "total_claims": self.total_claims,
             "grounded_claims": self.grounded_claims,
             "flagged_count": len(self.flagged),
+            "skipped_count": len(self.skipped),
             "cut_applied": self.cut_applied,
+            "judged": self.judged,
+            "backend": self.backend,
             "flagged": [_grounded_claim_dict(c) for c in self.flagged],
             "grounded": [_grounded_claim_dict(c) for c in self.grounded],
+            "skipped": [_grounded_claim_dict(c) for c in self.skipped],
         }
 
 
 def _grounded_claim_dict(gc: GroundedClaim) -> dict:
     d = asdict(gc)
     return d
+
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+_HEADING_RE = re.compile(r"^#{1,6}\s")
+_FENCE_RE = re.compile(r"^(```|~~~)")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Deterministic split: first by line, then by sentence punctuation
+    within each remaining line. No model: a boundary is not a judgment.
+
+    A short claim is still a claim: nothing here drops a candidate for being
+    few words, so a CTA line like "Ship 10x faster." is judged like any
+    other. Splitting at the line level first also excludes markdown
+    headings and fenced code blocks outright (a heading is a label, not an
+    assertion, and code is not prose), and it keeps each candidate an exact,
+    isolated substring of the source, so a later cut of one flagged claim
+    can never consume an adjacent heading or bullet.
+    """
+    candidate_lines: list[str] = []
+    in_fence = False
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or _HEADING_RE.match(line):
+            continue
+        candidate_lines.append(line)
+    parts: list[str] = []
+    for line in candidate_lines:
+        parts.extend(s.strip() for s in _SENTENCE_RE.split(line) if s.strip())
+    return parts
 
 
 _EXTRACT_SYSTEM = (
@@ -104,10 +165,15 @@ _EXTRACT_SYSTEM = (
 )
 
 
-def _coerce_claims(raw: str) -> list[Claim]:
-    """Parse the extractor's JSON into Claim objects. Tolerant of fences /
-    junk: on any parse failure, return an empty list so grounding degrades to
-    a no-op rather than crashing the pipeline."""
+def _coerce_claims(raw: str) -> list[Claim] | None:
+    """Parse the extractor's JSON into Claim objects. Tolerant of fences.
+
+    Returns ``None`` when the reply could not be interpreted as a claims
+    list at all (a JSON parse failure, or valid JSON that is not a list): an
+    explicit "could not parse" signal, distinct from a valid empty list
+    (``[]``), which means the model genuinely found no checkable claims. The
+    caller must not treat the two the same, or a parse failure silently
+    reads as "zero claims, nothing to flag."""
     text = raw.strip()
     if text.startswith("```"):
         # Strip a leading/trailing fence if the model added one.
@@ -118,9 +184,9 @@ def _coerce_claims(raw: str) -> list[Claim]:
         data = json.loads(text)
     except json.JSONDecodeError:
         logger.info("grounding_extract_unparseable", extra={"raw_head": raw[:120]})
-        return []
+        return None
     if not isinstance(data, list):
-        return []
+        return None
     claims: list[Claim] = []
     valid_kinds = {"metric", "capability", "comparison", "fact"}
     for item in data:
@@ -136,7 +202,7 @@ def _coerce_claims(raw: str) -> list[Claim]:
     return claims
 
 
-async def _extract_claims(text: str, llm_client) -> list[Claim]:
+async def _extract_claims(text: str, llm_client) -> list[Claim] | None:
     raw = await llm_client.generate(
         system_prompt=_EXTRACT_SYSTEM,
         user_prompt="Draft:\n\n" + text,
@@ -174,6 +240,44 @@ def _repo_facts_to_sources(repo_facts: list[dict] | None) -> list[Source]:
     return out
 
 
+# Which bucket a verified claim belongs in: "grounded", "flagged", or
+# "skipped" (verdict unavailable: not evidence either way, never cut).
+_VerifyBucket = str
+
+
+async def _verify(
+    claim: Claim, candidates: list[Source], judge: Judge, confidence_min: float
+) -> tuple[_VerifyBucket, GroundedClaim]:
+    if not candidates:
+        return "flagged", GroundedClaim(
+            claim=claim, grounded=False, sources=[], reason="No candidate sources in repo or KB."
+        )
+    evidence = "\n".join(f"({s.origin}:{s.ref}) {s.excerpt}" for s in candidates)
+    verdict = await judge.verify_claim(claim=claim.text, evidence=evidence)
+    if not verdict.available:
+        return "skipped", GroundedClaim(
+            claim=claim, grounded=False, sources=[], reason="Judgment skipped."
+        )
+    if verdict.relation == "contradicts":
+        return "flagged", GroundedClaim(
+            claim=claim,
+            grounded=False,
+            sources=candidates,
+            reason=f"Contradicted by the evidence (confidence {verdict.confidence:.2f}).",
+        )
+    if verdict.relation == "supports" and verdict.confidence >= confidence_min:
+        return "grounded", GroundedClaim(claim=claim, grounded=True, sources=candidates, reason="")
+    return "flagged", GroundedClaim(
+        claim=claim,
+        grounded=False,
+        sources=[],
+        reason=(
+            f"Not established: {verdict.relation} at confidence {verdict.confidence:.2f}, "
+            f"below {confidence_min:.2f}."
+        ),
+    )
+
+
 _ADJUDICATE_SYSTEM = (
     "You are a fact-checker. Given a CLAIM and a list of candidate SOURCES "
     "(excerpts from the product's own repo and knowledge base), decide whether "
@@ -185,7 +289,16 @@ _ADJUDICATE_SYSTEM = (
 )
 
 
-def _coerce_adjudication(raw: str, candidates: list[Source]) -> tuple[bool, list[Source], str]:
+def _coerce_adjudication(
+    raw: str, candidates: list[Source]
+) -> tuple[bool | None, list[Source], str]:
+    """Parse the fact-checker's JSON reply.
+
+    Returns ``(grounded, picked_sources, reason)``. ``grounded`` is an
+    explicit three-state signal, never inferred from the reason text: ``None``
+    means the reply could not be parsed at all (a skip, never a flag);
+    ``True``/``False`` means it parsed and rendered a verdict.
+    """
     text = raw.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -194,9 +307,9 @@ def _coerce_adjudication(raw: str, candidates: list[Source]) -> tuple[bool, list
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return False, [], "Could not parse fact-checker response."
+        return None, [], "Could not parse fact-checker response."
     if not isinstance(data, dict):
-        return False, [], "Fact-checker returned a non-object."
+        return None, [], "Fact-checker returned a non-object."
     grounded = bool(data.get("grounded", False))
     idxs = data.get("source_indexes", []) or []
     picked: list[Source] = []
@@ -211,9 +324,11 @@ def _coerce_adjudication(raw: str, candidates: list[Source]) -> tuple[bool, list
     return grounded, picked, reason
 
 
-async def _adjudicate(claim: Claim, candidates: list[Source], llm_client) -> GroundedClaim:
+async def _adjudicate(
+    claim: Claim, candidates: list[Source], llm_client
+) -> tuple[_VerifyBucket, GroundedClaim]:
     if not candidates:
-        return GroundedClaim(
+        return "flagged", GroundedClaim(
             claim=claim,
             grounded=False,
             sources=[],
@@ -231,7 +346,13 @@ async def _adjudicate(claim: Claim, candidates: list[Source], llm_client) -> Gro
         model="haiku",
     )
     grounded, picked, reason = _coerce_adjudication(raw, candidates)
-    return GroundedClaim(claim=claim, grounded=grounded, sources=picked, reason=reason)
+    if grounded is None:
+        # A skip, never a flag: a skipped judgment must never read as a pass,
+        # and cut_unsourced can never delete a sentence over a malformed reply.
+        return "skipped", GroundedClaim(claim=claim, grounded=False, sources=[], reason=reason)
+    if grounded:
+        return "grounded", GroundedClaim(claim=claim, grounded=True, sources=picked, reason=reason)
+    return "flagged", GroundedClaim(claim=claim, grounded=False, sources=picked, reason=reason)
 
 
 def _cut_flagged(text: str, flagged: list[GroundedClaim]) -> str:
@@ -262,39 +383,120 @@ async def ground_claims(
     *,
     text: str,
     kb: KnowledgeBaseSearch,
-    llm_client,
+    judge: Judge,
+    llm_client=None,
     repo_facts: list[dict] | None = None,
     cut_unsourced: bool = False,
+    confidence_min: float = 0.65,
 ) -> GroundingResult:
-    """Extract factual claims from ``text`` and verify each against the KB and
+    """Split ``text`` into claims and verify each against the KB and
     (optionally) repo facts.
 
     Args:
         text: The draft to ground.
         kb: A ``KnowledgeBaseSearch`` over the project's harvested KB.
-        llm_client: LLM client (uses Haiku for extraction + adjudication).
+        judge: The typed judgment port. When ``judge.available`` is True, this
+            path is used and ``llm_client`` is ignored entirely.
+        llm_client: Fallback LLM client (Haiku), used when ``judge`` is
+            unavailable, or when it is available but its claim selection
+            fails entirely. When neither an available judge's selection nor
+            ``llm_client`` produces a usable result (including an
+            unparseable Haiku extraction), the stage does not run: it
+            returns ``judged=False`` and leaves ``text`` untouched.
         repo_facts: Pre-fetched repo facts (commits / stats) as dicts with
             ``ref`` and ``excerpt``. Fetch once via ``github_tools`` and reuse.
         cut_unsourced: When True, delete flagged (unsourced) claim sentences
             from the returned text. When False, the text is untouched and the
-            claims are only flagged.
+            claims are only flagged. Skipped claims (verdict unavailable) are
+            never cut, regardless of this flag.
+        confidence_min: Minimum confidence for a "supports" verdict to count
+            as grounded. Only consulted on the typed judgment path.
 
     Returns:
         A JSON-serializable ``GroundingResult``.
     """
-    claims = await _extract_claims(text, llm_client)
-    repo_sources = _repo_facts_to_sources(repo_facts)
-
     grounded: list[GroundedClaim] = []
     flagged: list[GroundedClaim] = []
-    for claim in claims:
-        candidates = _kb_candidates(claim, kb) + repo_sources
-        gc = await _adjudicate(claim, candidates, llm_client)
-        if gc.grounded:
-            grounded.append(gc)
-        else:
-            flagged.append(gc)
+    skipped: list[GroundedClaim] = []
+    repo_sources = _repo_facts_to_sources(repo_facts)
 
+    backend: str | None = None
+    claims: list[Claim] = []
+
+    if judge.available:
+        sentences = _split_sentences(text)
+        if sentences:
+            probs = await judge.select_claims(sentences=sentences)
+            if probs is not None:
+                backend = "typesafe"
+                claims = [
+                    Claim(text=s, kind="fact")
+                    for s, p in zip(sentences, probs, strict=True)
+                    if p >= CLAIM_PROB_MIN
+                ]
+                for claim in claims:
+                    candidates = _kb_candidates(claim, kb) + repo_sources
+                    bucket, gc = await _verify(claim, candidates, judge, confidence_min)
+                    if bucket == "grounded":
+                        grounded.append(gc)
+                    elif bucket == "skipped":
+                        skipped.append(gc)
+                    else:
+                        flagged.append(gc)
+            # else: the typed claim selector failed entirely (any request
+            # error). That is not "zero claims": fall through to Haiku (spec
+            # order: TypeSafe, else Haiku, else skipped), never a pass.
+        # else: a non-empty text with zero candidate sentences (e.g. only
+        # headings or code) is also not a judgment: no request was made, so
+        # it must not render "0/0, judged by typesafe". Fall through exactly
+        # like a selector failure, never a silent typed-backend pass.
+
+    if backend is None and llm_client is not None:
+        backend = "haiku"
+        extracted = await _extract_claims(text, llm_client)
+        if extracted is None:
+            # The extractor's reply could not be parsed: this is "we could
+            # not judge," not "there were no claims." The stage ran (Haiku
+            # was asked) but produced nothing usable, so the draft as a
+            # whole is not judged, exactly like a total backend failure.
+            return GroundingResult(
+                total_claims=0,
+                grounded_claims=0,
+                flagged=[],
+                grounded=[],
+                cut_applied=False,
+                text_after=text,
+                judged=False,
+                backend=backend,
+            )
+        claims = extracted
+        for claim in claims:
+            candidates = _kb_candidates(claim, kb) + repo_sources
+            bucket, gc = await _adjudicate(claim, candidates, llm_client)
+            if bucket == "grounded":
+                grounded.append(gc)
+            elif bucket == "skipped":
+                skipped.append(gc)
+            else:
+                flagged.append(gc)
+
+    if backend is None:
+        # Neither backend produced a usable result: a failed TypeSafe
+        # selection with no llm_client to fall back to, or no backend at
+        # all. `judged=False` must never read as a pass.
+        return GroundingResult(
+            total_claims=0,
+            grounded_claims=0,
+            flagged=[],
+            grounded=[],
+            cut_applied=False,
+            text_after=text,
+            judged=False,
+            backend="none",
+        )
+
+    # cut_unsourced only ever touches `flagged`; a skipped claim is not
+    # evidence the claim is wrong, so it is never a candidate for deletion.
     cut_applied = False
     text_after = text
     if cut_unsourced and flagged:
@@ -307,7 +509,9 @@ async def ground_claims(
             "total": len(claims),
             "grounded": len(grounded),
             "flagged": len(flagged),
+            "skipped": len(skipped),
             "cut_applied": cut_applied,
+            "backend": backend,
         },
     )
     return GroundingResult(
@@ -317,4 +521,7 @@ async def ground_claims(
         grounded=grounded,
         cut_applied=cut_applied,
         text_after=text_after,
+        judged=True,
+        skipped=skipped,
+        backend=backend,
     )

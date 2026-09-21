@@ -1,0 +1,138 @@
+"""Frozen question specs for the typed judgment layer.
+
+Plain dataclasses on purpose: no SDK imports live here, so the questions stay
+testable and the dependency stays optional. The TypeSafe integration converts
+these into SDK question objects.
+
+Bump QUESTION_VERSION whenever any wording below changes. Cached verdicts are
+keyed on it, so a bump invalidates every stored judgment.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+QUESTION_VERSION = 3
+
+PATTERN_NONE = "none"
+
+
+@dataclass(frozen=True)
+class ChoiceSpec:
+    instructions: str
+    criteria: dict[str, str]
+
+
+@dataclass(frozen=True)
+class NoulSpec:
+    instructions: str
+
+
+# No ScoreSpec here on purpose. The only Scores in the spec (reader_impact,
+# breaking_risk) belong to Phase 4, which is blocked on the release loop. An
+# unused type is a liability; add it with its first caller.
+
+RELATION = ChoiceSpec(
+    instructions="How does the evidence relate to the claim?",
+    criteria={
+        "supports": ("The evidence states the claim or directly implies that it is true"),
+        "contradicts": ("The evidence states the opposite of the claim or implies it is false"),
+        "says_nothing": ("The evidence does not address what the claim asserts, either way"),
+    },
+)
+
+IS_FACTUAL_CLAIM = NoulSpec(
+    instructions=(
+        "Does `sentence` assert a checkable fact about this project (behaviour, API, "
+        "fix, version, measurement), as opposed to framing, instruction or opinion?"
+    ),
+)
+
+PATTERN = ChoiceSpec(
+    instructions=(
+        "Which writing pattern does `unit` exhibit? Judge only the text of `unit`. "
+        "Answer none unless the pattern is clearly present."
+    ),
+    criteria={
+        PATTERN_NONE: (
+            "The passage states its point plainly and exhibits none of the other patterns"
+        ),
+        "binary_contrast": (
+            "Uses a negation as a rhetorical setup for the point, such as It is not X, "
+            "it is Y, or The question is not X but Y, where the negated X is a straw "
+            "man added for emphasis rather than a claim anyone was making. Not this "
+            "pattern: a factual or technical distinction that corrects a specific, "
+            "plausible misreading or states a real limit of scope"
+        ),
+        "throat_clearing": (
+            "Opens with a filler move before the point, such as Here is the thing, "
+            "Let me be clear, or I will be honest"
+        ),
+        "faux_insight": (
+            "Flatters the writer as the lone expert, such as What nobody tells you or "
+            "The part everyone misses"
+        ),
+        "colon_reveal": (
+            "A noun phrase, a colon, then a short dramatic reveal used for emphasis "
+            "rather than for a list, label or quotation"
+        ),
+        "importance_puffery": (
+            "Asserts that something matters instead of stating the fact, such as marks a "
+            "pivotal moment, stands as a testament, or underscores its significance"
+        ),
+        "weasel_attribution": (
+            "Attributes a claim to an unnamed authority, such as experts agree, studies "
+            "show, or industry reports suggest"
+        ),
+        "metadiscourse": (
+            "Steps outside the subject to tell the reader what to notice or how much "
+            "weight to give it, such as The key point is or This distinction matters"
+        ),
+        "fake_profound_kicker": (
+            "Ends on an aphorism or metaphor that restates the point as a mic drop "
+            "rather than on a concrete fact or next action"
+        ),
+        "summary_recap": (
+            "Restates what the reader just read, such as In conclusion, Ultimately, or a "
+            "closing paragraph that adds no new fact"
+        ),
+        "superficial_analysis": (
+            "A trailing clause that pretends to explain meaning, such as highlighting, "
+            "underscoring, reflecting or showcasing some broader quality"
+        ),
+    },
+)
+
+# One Noul per pattern (all but PATTERN_NONE): a unit can exhibit more than one
+# pattern, and a single Choice over all patterns splits probability across
+# neighbours and misses at the threshold. Asking each pattern independently
+# does not.
+PATTERN_NOULS: dict[str, NoulSpec] = {
+    key: NoulSpec(instructions=f"Does `unit` exhibit this writing pattern? {definition}")
+    for key, definition in PATTERN.criteria.items()
+    if key != PATTERN_NONE
+}
+
+# Per-pattern hit thresholds. Fitted 2026-09-21 on two calibration corpora
+# (rematch + rematch3, 39 pooled human gold-none units, 78 observations at
+# 2 runs/unit). Rule: lowest t in 0.30..0.95 (step 0.05) at which the pattern
+# flags <= 2.5% of the pooled gold-none units; 1.01 (disabled) if none
+# qualified. Source of truth:
+# evidence-verify-typesafe/calibration/thresholds.json, sha256 prefix
+# 3b4ba9b2. Known cost at these thresholds: about 10-26% false flags on
+# human technical writing and about 30% on clean generated text (recall
+# about 81%); the previous llm_lint flagged about 75%. Shipped by owner
+# override after a failed held-out test. Never describe this gate as
+# having passed; see task-6d-brief.md.
+PATTERN_THRESHOLDS: dict[str, float] = {
+    "binary_contrast": 0.30,
+    "throat_clearing": 0.50,
+    "faux_insight": 0.30,
+    "colon_reveal": 0.45,
+    "importance_puffery": 0.90,
+    "weasel_attribution": 0.65,
+    "metadiscourse": 0.55,
+    "fake_profound_kicker": 0.75,
+    "summary_recap": 0.75,
+    "superficial_analysis": 0.75,
+}

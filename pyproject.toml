@@ -82,6 +82,16 @@ geo-google = [
     "google-search-results>=2.4.2",
 ]
 
+# Typed judgments (TypeSafe System One). Two stages consume it: grounding
+# (claim selection + verification) and the anti-slop stage (judge_patterns).
+# Without this extra (or without TYPESAFE_API_KEY): grounding falls back to
+# Haiku when an LLM client is available, otherwise it does not run and
+# reports itself unjudged; anti-slop falls back to the regex blocklist plus
+# llm_lint, unchanged from before typed judgments existed.
+typesafe = [
+    "typesafe-sdk>=0.7.0,<0.8.0",
+]
+
 # Convenience: full Growth pipeline (Selene + Vega + Cyra). GEO + CRO have
 # zero new deps; their AI clients reuse existing openai/anthropic/httpx.
 growth = [
@@ -97,8 +107,8 @@ dev = [
     "mypy>=1.5.0",
     "build>=1.0.0",
     "twine>=5.0.0",
-    # dev installs always pull video + growth deps so tests can exercise the full pipeline
-    "devrel-origin[video,growth]",
+    # dev installs always pull video + growth + typesafe deps so tests can exercise the full pipeline
+    "devrel-origin[video,growth,typesafe]",
 ]
 
 [project.urls]

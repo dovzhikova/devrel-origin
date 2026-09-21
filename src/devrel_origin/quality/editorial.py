@@ -30,10 +30,21 @@ from typing import Any
 
 from devrel_origin.project.paths import ProjectPaths
 from devrel_origin.quality.grounding import GroundingResult, ground_claims
+from devrel_origin.quality.judgments import Judge, build_judge, with_cost_sink
 from devrel_origin.quality.persona import test_against_persona
 from devrel_origin.quality.provenance import build_provenance
+from devrel_origin.quality.questions import PATTERN_THRESHOLDS
 from devrel_origin.quality.readability import check_against_target, compute_readability
-from devrel_origin.quality.slop import find_slop, force_rewrite, llm_lint, parse_blocklist
+from devrel_origin.quality.slop import (
+    PatternHit,
+    SlopHit,
+    find_patterns,
+    find_slop,
+    force_rewrite,
+    llm_lint,
+    parse_blocklist,
+    split_units,
+)
 from devrel_origin.quality.style import get_targets, load_style
 from devrel_origin.quality.voice import load_voice
 
@@ -145,32 +156,167 @@ async def _slop_stage(
     blocklist: list[str],
     voice: str,
     llm_client,
+    judge: Judge,
 ) -> tuple[str, StageResult]:
+    """Regex tier plus either the typed pattern judge or llm_lint.
+
+    `judge.available` picks the backend: with one, the stage runs the typed
+    per-pattern path (calibrated thresholds, quoted passages). Without one,
+    it falls back to the llm_lint path exactly as it behaved before the
+    typed judge existed, so a project without the extra sees no regression.
+
+    A judgment call can also fail once a judge is available: `judge_patterns`
+    catches its own request errors and returns `available=False` verdicts for
+    the affected units (see `judgments_typesafe.py`), which is silent by
+    design at that layer. This stage treats that as a third state, distinct
+    from "clean" and from "hit," mirroring the grounding stage's "not judged":
+
+    - Every unit unavailable is a total typed-judge failure. That is not
+      "zero patterns found"; the stage falls back to the llm_lint path
+      exactly as when no judge is available, and `detail` names `llm_lint`
+      as what ran.
+    - Some units unavailable, none of the judged units flag a real hit: the
+      stage never reports "clean" (an unjudged unit is not evidence of
+      anything). `detail` states how many units were not judged, and each
+      appears in `issues` as `"Not judged: <passage>"`. It also never
+      triggers a rewrite on its own: only a real hit (regex or a pattern
+      that cleared its threshold) does that. The same rule applies to the
+      post-rewrite recheck.
+    """
     t0 = time.monotonic()
-    regex_hits = find_slop(text_before, blocklist)
-    lint_hits = await llm_lint(text_before, voice, llm_client)
-    if not regex_hits and not lint_hits:
+
+    async def _llm_check(text: str) -> tuple[list[SlopHit], list[str]]:
+        return find_slop(text, blocklist), await llm_lint(text, voice, llm_client)
+
+    async def _typed_check(
+        text: str,
+    ) -> tuple[list[SlopHit], list[PatternHit], list[int], list[str]]:
+        regex_hits = find_slop(text, blocklist)
+        units = split_units(text)
+        verdicts = await judge.judge_patterns(units=units, voice=voice)
+        pattern_hits = find_patterns(text, verdicts, PATTERN_THRESHOLDS)
+        unjudged = sorted(v.unit_index for v in verdicts if not v.available)
+        return regex_hits, pattern_hits, unjudged, units
+
+    def _all_unjudged(unjudged: list[int], units: list[str]) -> bool:
+        return bool(units) and len(unjudged) == len(units)
+
+    def _unjudged_issues(unjudged: list[int], units: list[str]) -> list[str]:
+        return [f"Not judged: {units[i][:60]}" for i in unjudged]
+
+    async def _llm_lint_stage(reason: str | None) -> tuple[str, StageResult]:
+        """The whole stage on the llm_lint path. `reason` is appended to
+        `detail` (e.g. "llm_lint" when a typed judge failed outright);
+        `None` reproduces the exact plain "clean"/"rewrite_applied" strings
+        from before the typed judge existed, for the no-judge-at-all case."""
+        regex_hits, lint_hits = await _llm_check(text_before)
+        suffix = f" ({reason})" if reason else ""
+        if not regex_hits and not lint_hits:
+            return text_before, StageResult(
+                name="anti_slop",
+                text_before=text_before,
+                text_after=text_before,
+                duration_s=round(time.monotonic() - t0, 3),
+                detail=f"clean{suffix}",
+            )
+        rewritten = await force_rewrite(text_before, regex_hits, lint_hits, voice, llm_client)
+        re_regex, re_lint = await _llm_check(rewritten)
+        if re_regex or re_lint:
+            offenders = sorted({h.phrase for h in re_regex} | set(re_lint))
+            raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
+        return rewritten, StageResult(
+            name="anti_slop",
+            text_before=text_before,
+            text_after=rewritten,
+            duration_s=round(time.monotonic() - t0, 3),
+            issues=sorted({h.phrase for h in regex_hits} | set(lint_hits)),
+            detail=f"rewrite_applied{suffix}",
+        )
+
+    if not judge.available:
+        return await _llm_lint_stage(None)
+
+    regex_hits, pattern_hits, unjudged, units = await _typed_check(text_before)
+    if _all_unjudged(unjudged, units):
+        logger.warning(
+            "slop_typed_judge_failed_all_units",
+            extra={"backend": judge.backend, "unit_count": len(units)},
+        )
+        return await _llm_lint_stage("llm_lint")
+
+    if not regex_hits and not pattern_hits:
+        if unjudged:
+            return text_before, StageResult(
+                name="anti_slop",
+                text_before=text_before,
+                text_after=text_before,
+                duration_s=round(time.monotonic() - t0, 3),
+                issues=_unjudged_issues(unjudged, units),
+                detail=(
+                    f"{len(unjudged)} of {len(units)} units not judged (judged_by={judge.backend})"
+                ),
+            )
         return text_before, StageResult(
             name="anti_slop",
             text_before=text_before,
             text_after=text_before,
             duration_s=round(time.monotonic() - t0, 3),
-            detail="clean",
+            detail=f"clean (judged_by={judge.backend})",
         )
-    rewritten = await force_rewrite(text_before, regex_hits, lint_hits, voice, llm_client)
-    # Re-check after rewrite.
-    re_regex = find_slop(rewritten, blocklist)
-    re_lint = await llm_lint(rewritten, voice, llm_client)
-    if re_regex or re_lint:
-        offenders = sorted({h.phrase for h in re_regex} | set(re_lint))
+
+    rewritten = await force_rewrite(text_before, regex_hits, pattern_hits, voice, llm_client)
+    re_regex, re_pattern_hits, re_unjudged, re_units = await _typed_check(rewritten)
+
+    if _all_unjudged(re_unjudged, re_units):
+        # The recheck itself cannot be verified via the typed judge; fall
+        # back to llm_lint for this one check rather than silently trusting
+        # the rewrite is clean.
+        logger.warning(
+            "slop_typed_judge_failed_all_units_on_recheck",
+            extra={"backend": judge.backend, "unit_count": len(re_units)},
+        )
+        llm_re_regex, llm_re_lint = await _llm_check(rewritten)
+        if llm_re_regex or llm_re_lint:
+            offenders = sorted({h.phrase for h in llm_re_regex} | set(llm_re_lint))
+            raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
+        issues = sorted({h.phrase for h in regex_hits}) + [
+            f"{h.pattern}: {h.unit_text[:60]}" for h in pattern_hits
+        ]
+        return rewritten, StageResult(
+            name="anti_slop",
+            text_before=text_before,
+            text_after=rewritten,
+            duration_s=round(time.monotonic() - t0, 3),
+            issues=issues,
+            detail=(
+                f"rewrite_applied (judged_by={judge.backend}, "
+                "recheck via llm_lint after judge failure)"
+            ),
+        )
+
+    if re_regex or re_pattern_hits:
+        offenders = sorted({h.phrase for h in re_regex} | {h.pattern for h in re_pattern_hits})
         raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
+
+    issues = sorted({h.phrase for h in regex_hits}) + [
+        f"{h.pattern}: {h.unit_text[:60]}" for h in pattern_hits
+    ]
+    if re_unjudged:
+        issues += _unjudged_issues(re_unjudged, re_units)
+        detail = (
+            f"rewrite_applied (judged_by={judge.backend}, "
+            f"{len(re_unjudged)} of {len(re_units)} units not judged on recheck)"
+        )
+    else:
+        detail = f"rewrite_applied (judged_by={judge.backend})"
+
     return rewritten, StageResult(
         name="anti_slop",
         text_before=text_before,
         text_after=rewritten,
         duration_s=round(time.monotonic() - t0, 3),
-        issues=sorted({h.phrase for h in regex_hits} | set(lint_hits)),
-        detail="rewrite_applied",
+        issues=issues,
+        detail=detail,
     )
 
 
@@ -220,9 +366,11 @@ async def _grounding_stage(
     *,
     text: str,
     project_paths: ProjectPaths,
+    judge: Judge,
     llm_client,
     repo_facts: list[dict[str, Any]] | None,
     cut_unsourced: bool,
+    confidence_min: float = 0.65,
 ) -> tuple[str, StageResult, GroundingResult]:
     """Optional stage: verify factual claims against the KB + repo facts.
 
@@ -238,11 +386,40 @@ async def _grounding_stage(
     gr = await ground_claims(
         text=text,
         kb=kb,
+        judge=judge,
         llm_client=llm_client,
         repo_facts=repo_facts,
         cut_unsourced=cut_unsourced,
+        confidence_min=confidence_min,
     )
+    if not gr.judged:
+        # Not a pass. `backend == "none"` means no backend ever ran (no typed
+        # judge, no llm_client): the stage never attempted anything. Any
+        # other backend name means one DID run and still failed (an
+        # unparseable Haiku reply, or a typed selector failure with nothing
+        # to fall back to); naming it distinguishes "nothing to ask" from
+        # "asked and got nothing usable back."
+        detail = (
+            "skipped: no judgment backend"
+            if gr.backend == "none"
+            else f"not judged (backend={gr.backend})"
+        )
+        return (
+            text,
+            StageResult(
+                name="grounding",
+                text_before=text,
+                text_after=text,
+                duration_s=round(time.monotonic() - t0, 3),
+                detail=detail,
+            ),
+            gr,
+        )
+    # A skipped claim (verdict unavailable) is not the same finding as an
+    # unsourced one; keep them in separate issue lines so a reader (or a CI
+    # gate parsing issues) never mistakes "not judged" for "checked and bad."
     issues = [f"Unsourced: {c.claim.text}" for c in gr.flagged]
+    issues += [f"Not judged: {c.claim.text}" for c in gr.skipped]
     sr = StageResult(
         name="grounding",
         text_before=text,
@@ -250,7 +427,10 @@ async def _grounding_stage(
         duration_s=round(time.monotonic() - t0, 3),
         issues=issues,
         detail=(
-            f"{gr.grounded_claims}/{gr.total_claims} grounded" + (", cut" if gr.cut_applied else "")
+            f"{gr.grounded_claims}/{gr.total_claims} grounded"
+            + (", cut" if gr.cut_applied else "")
+            + (f", {len(gr.skipped)} not judged" if gr.skipped else "")
+            + f", judged_by={gr.backend}"
         ),
     )
     return gr.text_after, sr, gr
@@ -285,6 +465,13 @@ async def run_pipeline(
         if project_paths.slop_file.is_file()
         else ""
     )
+    judge = build_judge()
+    if project_paths.state_db.is_file():
+        # Imports core.llm (via project.cost_sink), which imports this module
+        # through core/kai.py, so a top-level import here would cycle.
+        from devrel_origin.project.cost_sink import make_sqlite_sink
+
+        judge = with_cost_sink(judge, make_sqlite_sink(project_paths.state_db))
 
     # Fail-fast on unknown content_type before any LLM spend.
     get_targets(content_type, style_md)
@@ -331,6 +518,7 @@ async def run_pipeline(
         blocklist=blocklist,
         voice=voice,
         llm_client=llm_client,
+        judge=judge,
     )
     stages.append(sr)
 
@@ -371,6 +559,7 @@ async def run_pipeline(
             blocklist=blocklist,
             voice=voice,
             llm_client=llm_client,
+            judge=judge,
         )
         stages.append(sr)
 
@@ -402,6 +591,7 @@ async def run_pipeline(
         text, grounding_sr, grounding_result = await _grounding_stage(
             text=text,
             project_paths=project_paths,
+            judge=judge,
             llm_client=llm_client,
             repo_facts=repo_facts,
             cut_unsourced=cut_unsourced,

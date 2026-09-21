@@ -78,7 +78,29 @@ def build_provenance(
             }
         )
 
-    grounded_ok = grounding is not None and grounding.get("flagged_count", 0) == 0
+    if grounding is not None:
+        judged = grounding.get("judged", True)
+        skipped_count = grounding.get("skipped_count", 0)
+        grounded_ok = judged and grounding.get("flagged_count", 0) == 0 and skipped_count == 0
+        grounding_summary = {
+            "total_claims": grounding.get("total_claims", 0),
+            "grounded_claims": grounding.get("grounded_claims", 0),
+            "flagged_count": grounding.get("flagged_count", 0),
+            "cut_applied": grounding.get("cut_applied", False),
+            "judged": judged,
+            "skipped_count": skipped_count,
+            "backend": grounding.get("backend", "none"),
+        }
+    else:
+        grounded_ok = False
+        # Shape matches the pre-`judged`/`skipped_count` output exactly: with
+        # ground=False, grounding is None and this branch has always run.
+        grounding_summary = {
+            "total_claims": 0,
+            "grounded_claims": 0,
+            "flagged_count": 0,
+            "cut_applied": False,
+        }
 
     citations: list[dict[str, Any]] = []
     unsourced: list[dict[str, Any]] = []
@@ -111,12 +133,7 @@ def build_provenance(
         "stages": stage_records,
         "grounding_ran": grounding is not None,
         "grounded_ok": grounded_ok,
-        "grounding_summary": {
-            "total_claims": grounding.get("total_claims", 0) if grounding else 0,
-            "grounded_claims": grounding.get("grounded_claims", 0) if grounding else 0,
-            "flagged_count": grounding.get("flagged_count", 0) if grounding else 0,
-            "cut_applied": grounding.get("cut_applied", False) if grounding else False,
-        },
+        "grounding_summary": grounding_summary,
         "citations": citations,
         "unsourced": unsourced,
     }
@@ -142,15 +159,25 @@ def render_pr_summary(provenance: dict[str, Any]) -> str:
         lines.append(f"- [{mark}] `{s.get('name', '')}`{score_txt}{detail_txt}")
     lines.append("")
 
-    # Grounding guarantee.
+    # Grounding guarantee. "Not judged" is a distinct state from pass and
+    # from flagged, at both levels: a skip must never render as PASS.
     if provenance.get("grounding_ran"):
         gs = provenance.get("grounding_summary", {})
-        badge = "PASS" if provenance.get("grounded_ok") else "FLAGGED"
+        judged = gs.get("judged", True)
+        skipped_count = gs.get("skipped_count", 0)
+        if not judged:
+            badge = "SKIPPED"
+        elif skipped_count:
+            badge = f"PARTIAL: {skipped_count} of {gs.get('total_claims', 0)} claims not judged"
+        else:
+            badge = "PASS" if provenance.get("grounded_ok") else "FLAGGED"
         lines.append(f"### Grounding: {badge}")
+        backend = gs.get("backend", "none")
         lines.append(
             f"{gs.get('grounded_claims', 0)}/{gs.get('total_claims', 0)} claims sourced"
             + (f", {gs.get('flagged_count', 0)} unsourced" if gs.get("flagged_count") else "")
             + (" (cut)" if gs.get("cut_applied") else "")
+            + (f", judged by {backend}" if judged and backend != "none" else "")
         )
         lines.append("")
 

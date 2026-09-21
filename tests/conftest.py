@@ -8,6 +8,20 @@ from devrel_origin.core.llm import LLMClient
 from devrel_origin.tools.api_client import PostHogClient
 from devrel_origin.tools.github_tools import GitHubIssue, GitHubTools
 
+
+@pytest.fixture(autouse=True)
+def _no_ambient_typesafe_key(monkeypatch):
+    """`build_judge()` reads `TYPESAFE_API_KEY` straight from the environment.
+    A developer's shell may export a real one (it does in this repo's dev
+    environment), and the anti-slop stage now calls `judge.judge_patterns`
+    whenever `judge.available`. Without this, any test that exercises
+    `run_pipeline`/`_slop_stage` without explicitly mocking the judge would
+    make a real, paid, non-deterministic network call. Strip it by default;
+    a test that wants a real-looking key sets it back with
+    `monkeypatch.setenv`."""
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+
+
 # The 21-test baseline-xfail set was retired in v0.2.7 dogfood follow-on;
 # every entry is now either renamed-and-passing or asserts the new behavior
 # directly. If new prod-vs-test drift accumulates, re-introduce the xfail

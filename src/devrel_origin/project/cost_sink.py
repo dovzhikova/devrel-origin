@@ -14,6 +14,11 @@ from typing import Any
 from devrel_origin.core.llm import MODEL_COSTS
 
 
+def is_priced(model: str) -> bool:
+    """Return True when the price table can price `model`."""
+    return model in MODEL_COSTS
+
+
 def _compute_cost_usd(model: str, usage: dict[str, Any]) -> float:
     pricing = MODEL_COSTS.get(model)
     if pricing is None:

@@ -148,3 +148,4 @@ context_archive/
 # Vox writes rendered videos to `output/videos/` in CWD by default.
 # Local-only artifacts; never commit.
 output/
+evidence-verify-typesafe/
