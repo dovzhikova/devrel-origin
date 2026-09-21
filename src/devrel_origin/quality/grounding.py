@@ -12,13 +12,21 @@ it on for hero / CTA / landing-page artifacts where an unsourced claim is
 expensive.
 
 Three steps, mirroring the anti-slop stage's shape:
-1. Extract discrete factual claims from the draft (one Haiku call, strict JSON).
-   Pure opinion / instructions / code are not claims and are skipped.
+1. Split the draft into sentences deterministically (no model: a sentence
+   boundary is not a judgment), then select which sentences are factual
+   claims via a typed judgment (``Judge.select_claims``).
 2. For each claim, gather candidate evidence: KB search hits plus (optionally)
    repo facts. This is deterministic retrieval, no LLM.
-3. Adjudicate each claim against its candidates (one Haiku call per claim):
-   does any candidate actually support it? Supported claims cite their source;
-   unsupported claims are flagged as unsourced.
+3. Verify each claim against its candidates via a typed judgment
+   (``Judge.verify_claim``): does the evidence support it, contradict it, or
+   say nothing about it? A claim counts as grounded only when the evidence
+   supports it at or above ``confidence_min``; a contradiction is always
+   flagged, regardless of confidence.
+
+Degradation differs from the anti-slop stage: grounding has no deterministic
+fallback. With ``NullJudge`` (no judgment backend configured), the stage does
+not substitute a lesser check; it reports ``judged=False``, grounds nothing,
+flags nothing, and leaves the text untouched.
 
 The output ``GroundingResult`` is JSON-serializable and feeds the provenance
 trail (see ``quality.provenance``).
@@ -26,15 +34,19 @@ trail (see ``quality.provenance``).
 
 from __future__ import annotations
 
-import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
+
+from devrel_origin.quality.judgments import Judge
 
 if TYPE_CHECKING:
     from devrel_origin.core.base import KnowledgeBaseSearch
 
 logger = logging.getLogger(__name__)
+
+CLAIM_PROB_MIN = 0.5
 
 
 @dataclass(frozen=True)
@@ -42,7 +54,7 @@ class Claim:
     """A discrete factual assertion extracted from the draft."""
 
     text: str
-    kind: str  # "metric", "capability", "comparison", "fact"
+    kind: str  # always "fact": deterministic splitting cannot infer a taxonomy
 
 
 @dataclass(frozen=True)
@@ -56,7 +68,7 @@ class Source:
 
 @dataclass
 class GroundedClaim:
-    """A claim after adjudication against candidate sources."""
+    """A claim after verification against candidate sources."""
 
     claim: Claim
     grounded: bool
@@ -70,10 +82,11 @@ class GroundingResult:
 
     total_claims: int
     grounded_claims: int
-    flagged: list[GroundedClaim]  # unsourced claims
+    flagged: list[GroundedClaim]  # unsourced or contradicted claims
     grounded: list[GroundedClaim]  # sourced claims (with citations)
     cut_applied: bool  # whether unsourced claims were removed from the text
     text_after: str
+    judged: bool = True  # False when no judgment backend was available
 
     def to_dict(self) -> dict:
         """JSON-serializable view for the provenance trail."""
@@ -82,6 +95,7 @@ class GroundingResult:
             "grounded_claims": self.grounded_claims,
             "flagged_count": len(self.flagged),
             "cut_applied": self.cut_applied,
+            "judged": self.judged,
             "flagged": [_grounded_claim_dict(c) for c in self.flagged],
             "grounded": [_grounded_claim_dict(c) for c in self.grounded],
         }
@@ -92,57 +106,13 @@ def _grounded_claim_dict(gc: GroundedClaim) -> dict:
     return d
 
 
-_EXTRACT_SYSTEM = (
-    "You extract discrete, checkable factual claims from marketing / developer "
-    "content. A claim is an assertion that could be TRUE or FALSE about the "
-    "product: a metric ('cuts build time 40%'), a capability ('supports "
-    "OpenTelemetry'), a comparison ('faster than X'), or a concrete fact. "
-    "Opinions, calls-to-action, instructions, headings, and code are NOT claims. "
-    "Return strict JSON: a list of objects with 'text' (the claim, quoted from "
-    "the draft) and 'kind' (one of: metric, capability, comparison, fact). "
-    "Return [] if there are no checkable claims. No prose, no markdown fences."
-)
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
 
-def _coerce_claims(raw: str) -> list[Claim]:
-    """Parse the extractor's JSON into Claim objects. Tolerant of fences /
-    junk: on any parse failure, return an empty list so grounding degrades to
-    a no-op rather than crashing the pipeline."""
-    text = raw.strip()
-    if text.startswith("```"):
-        # Strip a leading/trailing fence if the model added one.
-        text = text.strip("`")
-        if "\n" in text:
-            text = text.split("\n", 1)[1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        logger.info("grounding_extract_unparseable", extra={"raw_head": raw[:120]})
-        return []
-    if not isinstance(data, list):
-        return []
-    claims: list[Claim] = []
-    valid_kinds = {"metric", "capability", "comparison", "fact"}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        ctext = str(item.get("text", "")).strip()
-        if not ctext:
-            continue
-        kind = str(item.get("kind", "fact")).strip().lower()
-        if kind not in valid_kinds:
-            kind = "fact"
-        claims.append(Claim(text=ctext, kind=kind))
-    return claims
-
-
-async def _extract_claims(text: str, llm_client) -> list[Claim]:
-    raw = await llm_client.generate(
-        system_prompt=_EXTRACT_SYSTEM,
-        user_prompt="Draft:\n\n" + text,
-        model="haiku",
-    )
-    return _coerce_claims(raw)
+def _split_sentences(text: str) -> list[str]:
+    """Deterministic split. No model: a sentence boundary is not a judgment."""
+    parts = [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
+    return [p for p in parts if len(p.split()) >= 4]
 
 
 def _kb_candidates(claim: Claim, kb: KnowledgeBaseSearch, limit: int = 3) -> list[Source]:
@@ -174,64 +144,35 @@ def _repo_facts_to_sources(repo_facts: list[dict] | None) -> list[Source]:
     return out
 
 
-_ADJUDICATE_SYSTEM = (
-    "You are a fact-checker. Given a CLAIM and a list of candidate SOURCES "
-    "(excerpts from the product's own repo and knowledge base), decide whether "
-    "any source actually SUPPORTS the claim. Be strict: a source supports a "
-    "claim only if it states or directly implies it. Topical overlap is NOT "
-    'support. Return strict JSON: {"grounded": true|false, "source_indexes": '
-    '[0-based ints of supporting sources], "reason": "one sentence"}. '
-    "No prose outside the JSON, no markdown fences."
-)
-
-
-def _coerce_adjudication(raw: str, candidates: list[Source]) -> tuple[bool, list[Source], str]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if "\n" in text:
-            text = text.split("\n", 1)[1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return False, [], "Could not parse fact-checker response."
-    if not isinstance(data, dict):
-        return False, [], "Fact-checker returned a non-object."
-    grounded = bool(data.get("grounded", False))
-    idxs = data.get("source_indexes", []) or []
-    picked: list[Source] = []
-    if isinstance(idxs, list):
-        for i in idxs:
-            if isinstance(i, int) and 0 <= i < len(candidates):
-                picked.append(candidates[i])
-    reason = str(data.get("reason", "")).strip()
-    # A "grounded" verdict with no cited source is not provable; downgrade it.
-    if grounded and not picked:
-        return False, [], reason or "Marked grounded but cited no source."
-    return grounded, picked, reason
-
-
-async def _adjudicate(claim: Claim, candidates: list[Source], llm_client) -> GroundedClaim:
+async def _verify(
+    claim: Claim, candidates: list[Source], judge: Judge, confidence_min: float
+) -> GroundedClaim:
     if not candidates:
+        return GroundedClaim(
+            claim=claim, grounded=False, sources=[], reason="No candidate sources in repo or KB."
+        )
+    evidence = "\n".join(f"({s.origin}:{s.ref}) {s.excerpt}" for s in candidates)
+    verdict = await judge.verify_claim(claim=claim.text, evidence=evidence)
+    if not verdict.available:
+        return GroundedClaim(claim=claim, grounded=False, sources=[], reason="Judgment skipped.")
+    if verdict.relation == "contradicts":
         return GroundedClaim(
             claim=claim,
             grounded=False,
-            sources=[],
-            reason="No candidate sources in repo or KB.",
+            sources=candidates,
+            reason=f"Contradicted by the evidence (confidence {verdict.confidence:.2f}).",
         )
-    listing = "\n".join(f"[{i}] ({s.origin}:{s.ref}) {s.excerpt}" for i, s in enumerate(candidates))
-    user = (
-        "CLAIM:\n" + claim.text + "\n\n"
-        "CANDIDATE SOURCES:\n" + listing + "\n\n"
-        "Which sources, if any, support the claim?"
+    if verdict.relation == "supports" and verdict.confidence >= confidence_min:
+        return GroundedClaim(claim=claim, grounded=True, sources=candidates, reason="")
+    return GroundedClaim(
+        claim=claim,
+        grounded=False,
+        sources=[],
+        reason=(
+            f"Not established: {verdict.relation} at confidence {verdict.confidence:.2f}, "
+            f"below {confidence_min:.2f}."
+        ),
     )
-    raw = await llm_client.generate(
-        system_prompt=_ADJUDICATE_SYSTEM,
-        user_prompt=user,
-        model="haiku",
-    )
-    grounded, picked, reason = _coerce_adjudication(raw, candidates)
-    return GroundedClaim(claim=claim, grounded=grounded, sources=picked, reason=reason)
 
 
 def _cut_flagged(text: str, flagged: list[GroundedClaim]) -> str:
@@ -262,38 +203,58 @@ async def ground_claims(
     *,
     text: str,
     kb: KnowledgeBaseSearch,
-    llm_client,
+    judge: Judge,
     repo_facts: list[dict] | None = None,
     cut_unsourced: bool = False,
+    confidence_min: float = 0.65,
 ) -> GroundingResult:
-    """Extract factual claims from ``text`` and verify each against the KB and
-    (optionally) repo facts.
+    """Split ``text`` into claims and verify each against the KB and
+    (optionally) repo facts, using ``judge`` for both claim selection and
+    verification.
 
     Args:
         text: The draft to ground.
         kb: A ``KnowledgeBaseSearch`` over the project's harvested KB.
-        llm_client: LLM client (uses Haiku for extraction + adjudication).
+        judge: The judgment port. With an unavailable judge (``NullJudge``),
+            the stage does not run: it returns ``judged=False`` and leaves
+            ``text`` untouched.
         repo_facts: Pre-fetched repo facts (commits / stats) as dicts with
             ``ref`` and ``excerpt``. Fetch once via ``github_tools`` and reuse.
         cut_unsourced: When True, delete flagged (unsourced) claim sentences
             from the returned text. When False, the text is untouched and the
             claims are only flagged.
+        confidence_min: Minimum confidence for a "supports" verdict to count
+            as grounded.
 
     Returns:
         A JSON-serializable ``GroundingResult``.
     """
-    claims = await _extract_claims(text, llm_client)
-    repo_sources = _repo_facts_to_sources(repo_facts)
+    if not judge.available:
+        return GroundingResult(
+            total_claims=0,
+            grounded_claims=0,
+            flagged=[],
+            grounded=[],
+            cut_applied=False,
+            text_after=text,
+            judged=False,
+        )
 
+    sentences = _split_sentences(text)
+    probs = await judge.select_claims(sentences=sentences)
+    claims = [
+        Claim(text=s, kind="fact")
+        for s, p in zip(sentences, probs, strict=True)
+        if p >= CLAIM_PROB_MIN
+    ]
+
+    repo_sources = _repo_facts_to_sources(repo_facts)
     grounded: list[GroundedClaim] = []
     flagged: list[GroundedClaim] = []
     for claim in claims:
         candidates = _kb_candidates(claim, kb) + repo_sources
-        gc = await _adjudicate(claim, candidates, llm_client)
-        if gc.grounded:
-            grounded.append(gc)
-        else:
-            flagged.append(gc)
+        gc = await _verify(claim, candidates, judge, confidence_min)
+        (grounded if gc.grounded else flagged).append(gc)
 
     cut_applied = False
     text_after = text
@@ -308,6 +269,7 @@ async def ground_claims(
             "grounded": len(grounded),
             "flagged": len(flagged),
             "cut_applied": cut_applied,
+            "backend": judge.backend,
         },
     )
     return GroundingResult(
@@ -317,4 +279,5 @@ async def ground_claims(
         grounded=grounded,
         cut_applied=cut_applied,
         text_after=text_after,
+        judged=True,
     )

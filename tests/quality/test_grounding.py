@@ -1,27 +1,29 @@
 """Tests for the grounding stage (quality/grounding.py).
 
-Grounding extracts factual claims, retrieves KB + repo candidate sources, then
-adjudicates each claim. All LLM calls are mocked (extraction + adjudication);
-the KB is a real TF-IDF index over a tmp directory. No network, no real APIs.
+Grounding splits the draft into sentences deterministically, selects claims
+and verifies them through the typed judgment port (``Judge``), then retrieves
+KB + repo candidate sources. The KB is a real TF-IDF index over a tmp
+directory. No network, no real APIs: every judgment comes from ``FakeJudge``
+or ``NullJudge``.
 """
 
 from __future__ import annotations
-
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from devrel_origin.core.base import KnowledgeBaseSearch
 from devrel_origin.quality.grounding import (
     Claim,
+    GroundedClaim,
     GroundingResult,
-    _coerce_adjudication,
-    _coerce_claims,
+    Source,
     _cut_flagged,
     _kb_candidates,
     _repo_facts_to_sources,
     ground_claims,
 )
+from devrel_origin.quality.judgments import NullJudge
+from tests.quality.fakes import FakeJudge
 
 
 def _kb(tmp_path):
@@ -35,52 +37,15 @@ def _kb(tmp_path):
     return KnowledgeBaseSearch(d)
 
 
+class _EmptyKB:
+    def search(self, query, limit=5, **kwargs):
+        # kwargs absorbs _kb_candidates' content_truncate / pad_with_remaining,
+        # which the real KnowledgeBaseSearch.search accepts; this fake always
+        # returns no matches regardless.
+        return []
+
+
 # --- pure helpers ----------------------------------------------------------
-
-
-def test_coerce_claims_parses_json_list():
-    raw = '[{"text": "cuts build time 40%", "kind": "metric"}, {"text": "supports OTel", "kind": "capability"}]'
-    claims = _coerce_claims(raw)
-    assert len(claims) == 2
-    assert claims[0].kind == "metric"
-    assert claims[1].text == "supports OTel"
-
-
-def test_coerce_claims_tolerates_fences_and_junk():
-    assert _coerce_claims("```json\nnot json\n```") == []
-    assert _coerce_claims("total garbage") == []
-    assert _coerce_claims('{"not": "a list"}') == []
-
-
-def test_coerce_claims_defaults_unknown_kind_to_fact():
-    claims = _coerce_claims('[{"text": "x", "kind": "weird"}]')
-    assert claims[0].kind == "fact"
-
-
-def test_coerce_adjudication_grounded_requires_cited_source():
-    candidates = _repo_facts_to_sources([{"ref": "commit:abc", "excerpt": "shipped OTel"}])
-    # Grounded but no source_indexes → downgraded to not grounded.
-    grounded, picked, _ = _coerce_adjudication(
-        '{"grounded": true, "source_indexes": [], "reason": "ok"}', candidates
-    )
-    assert grounded is False
-    assert picked == []
-
-
-def test_coerce_adjudication_picks_valid_sources():
-    candidates = _repo_facts_to_sources(
-        [
-            {"ref": "commit:abc", "excerpt": "shipped OTel"},
-            {"ref": "repo_stats", "excerpt": "100 stars"},
-        ]
-    )
-    grounded, picked, reason = _coerce_adjudication(
-        '{"grounded": true, "source_indexes": [1], "reason": "stat matches"}', candidates
-    )
-    assert grounded is True
-    assert len(picked) == 1
-    assert picked[0].ref == "repo_stats"
-    assert reason == "stat matches"
 
 
 def test_repo_facts_to_sources_skips_incomplete():
@@ -97,8 +62,6 @@ def test_kb_candidates_only_real_matches(tmp_path):
 
 
 def test_cut_flagged_removes_claim_text():
-    from devrel_origin.quality.grounding import GroundedClaim
-
     text = "Our product is fast. It cuts build time 40%. Try it."
     flagged = [
         GroundedClaim(claim=Claim(text="It cuts build time 40%.", kind="metric"), grounded=False)
@@ -108,98 +71,8 @@ def test_cut_flagged_removes_claim_text():
     assert "Our product is fast." in out
 
 
-# --- end-to-end (mocked LLM) ----------------------------------------------
-
-
-def _client(extract_json: str, adjudications: list[str]):
-    """LLM mock: first call is extraction, subsequent calls are adjudications."""
-    client = MagicMock()
-    adj_iter = iter(adjudications)
-
-    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
-        if "extract discrete" in system_prompt:
-            return extract_json
-        if "fact-checker" in system_prompt:
-            return next(adj_iter)
-        return ""
-
-    client.generate = AsyncMock(side_effect=_generate)
-    return client
-
-
-@pytest.mark.asyncio
-async def test_ground_claims_grounded_and_flagged(tmp_path):
-    kb = _kb(tmp_path)
-    extract = (
-        '[{"text": "auto-instruments for OpenTelemetry", "kind": "capability"},'
-        ' {"text": "used by NASA", "kind": "fact"}]'
-    )
-    # Claim 1 grounded to the KB source at index 0; claim 2 unsourced.
-    adj = [
-        '{"grounded": true, "source_indexes": [0], "reason": "kb states it"}',
-        '{"grounded": false, "source_indexes": [], "reason": "no source"}',
-    ]
-    client = _client(extract, adj)
-
-    result = await ground_claims(text="draft text", kb=kb, llm_client=client)
-
-    assert isinstance(result, GroundingResult)
-    assert result.total_claims == 2
-    assert result.grounded_claims == 1
-    assert len(result.flagged) == 1
-    assert result.flagged[0].claim.text == "used by NASA"
-    assert result.grounded[0].sources[0].origin == "kb"
-    assert result.cut_applied is False
-
-
-@pytest.mark.asyncio
-async def test_ground_claims_cut_removes_unsourced(tmp_path):
-    kb = _kb(tmp_path)
-    text = "Great tool. Used by NASA. Ships fast."
-    extract = '[{"text": "Used by NASA.", "kind": "fact"}]'
-    adj = ['{"grounded": false, "source_indexes": [], "reason": "no source"}']
-    client = _client(extract, adj)
-
-    result = await ground_claims(text=text, kb=kb, llm_client=client, cut_unsourced=True)
-    assert result.cut_applied is True
-    assert "NASA" not in result.text_after
-    assert "Great tool." in result.text_after
-
-
-@pytest.mark.asyncio
-async def test_ground_claims_no_claims_is_noop(tmp_path):
-    kb = _kb(tmp_path)
-    client = _client("[]", [])
-    result = await ground_claims(text="Hello.", kb=kb, llm_client=client)
-    assert result.total_claims == 0
-    assert result.grounded_claims == 0
-    assert result.flagged == []
-    assert result.text_after == "Hello."
-
-
-@pytest.mark.asyncio
-async def test_ground_claims_uses_repo_facts(tmp_path):
-    kb = _kb(tmp_path)
-    extract = '[{"text": "we shipped OTel support", "kind": "capability"}]'
-    # Adjudication grounds to a repo fact. KB match for otel also exists, so the
-    # repo fact is appended after KB candidates; index will be beyond KB hits.
-    repo_facts = [{"ref": "commit:deadbeef01", "excerpt": "feat: add OpenTelemetry export"}]
-    # Ground against whichever index the fact-checker returns; we force it to
-    # pick a repo source by returning the last index dynamically via a wide pick.
-    adj = ['{"grounded": true, "source_indexes": [0], "reason": "commit shows it"}']
-    client = _client(extract, adj)
-
-    result = await ground_claims(text="draft", kb=kb, llm_client=client, repo_facts=repo_facts)
-    assert result.grounded_claims == 1
-    # The cited source at index 0 is a KB candidate (kb ranked first); the repo
-    # fact is still available as a candidate. Assert grounding succeeded.
-    assert result.grounded[0].grounded is True
-
-
-def test_grounding_result_to_dict_is_serializable(tmp_path):
+def test_grounding_result_to_dict_is_serializable():
     import json
-
-    from devrel_origin.quality.grounding import GroundedClaim, Source
 
     gr = GroundingResult(
         total_claims=1,
@@ -219,3 +92,125 @@ def test_grounding_result_to_dict_is_serializable(tmp_path):
     d = gr.to_dict()
     json.dumps(d)  # must not raise
     assert d["grounded"][0]["sources"][0]["ref"] == "docs/x.md"
+    assert d["judged"] is True
+
+
+# --- end-to-end (typed judgments) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_grounded_and_flagged(tmp_path):
+    kb = _kb(tmp_path)
+    # Sentence 1 matches the KB verbatim; sentence 2 has no KB or repo match,
+    # so it is flagged without even consuming a judge.verify_claim call.
+    text = (
+        "The agent auto-instruments applications for OpenTelemetry with zero "
+        "code changes. It is trusted by many teams around the world today."
+    )
+    judge = FakeJudge(relations=[("supports", 0.82)])
+
+    result = await ground_claims(text=text, kb=kb, judge=judge)
+
+    assert isinstance(result, GroundingResult)
+    assert result.total_claims == 2
+    assert result.grounded_claims == 1
+    assert len(result.flagged) == 1
+    assert result.flagged[0].reason == "No candidate sources in repo or KB."
+    assert result.grounded[0].sources[0].origin == "kb"
+    assert result.cut_applied is False
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_cut_removes_unsourced(tmp_path):
+    kb = _kb(tmp_path)
+    text = (
+        "The agent auto-instruments applications for OpenTelemetry with zero "
+        "code changes. It is used by NASA for critical infrastructure systems."
+    )
+    judge = FakeJudge(relations=[("supports", 0.9)])
+
+    result = await ground_claims(text=text, kb=kb, judge=judge, cut_unsourced=True)
+    assert result.cut_applied is True
+    assert "NASA" not in result.text_after
+    assert "OpenTelemetry" in result.text_after
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_no_claims_is_noop(tmp_path):
+    kb = _kb(tmp_path)
+    judge = FakeJudge()
+    result = await ground_claims(text="Hello.", kb=kb, judge=judge)
+    assert result.total_claims == 0
+    assert result.grounded_claims == 0
+    assert result.flagged == []
+    assert result.text_after == "Hello."
+
+
+@pytest.mark.asyncio
+async def test_ground_claims_uses_repo_facts(tmp_path):
+    kb = _kb(tmp_path)
+    # No overlap with the KB docs, so the only candidate is the repo fact.
+    text = "We recently shipped a brand new bundler cache feature to the platform today."
+    repo_facts = [{"ref": "commit:deadbeef01", "excerpt": "feat: add bundler cache"}]
+    judge = FakeJudge(relations=[("supports", 0.9)])
+
+    result = await ground_claims(text=text, kb=kb, judge=judge, repo_facts=repo_facts)
+    assert result.grounded_claims == 1
+    assert result.grounded[0].sources[0].origin == "repo"
+
+
+# --- brief's four tests ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_supported_claim_above_threshold_is_grounded():
+    judge = FakeJudge(relations=[("supports", 0.82)])
+    result = await ground_claims(
+        text="The release adds a ranked next-action queue.",
+        kb=_EmptyKB(),
+        judge=judge,
+        repo_facts=[{"ref": "d25ca04", "excerpt": "feat: devrel next action queue"}],
+    )
+    assert result.grounded_claims == 1
+    assert result.flagged == []
+
+
+@pytest.mark.asyncio
+async def test_a_supported_claim_below_threshold_is_flagged_not_trusted():
+    # The pshat spike produced a wrong `supports` at 0.33. Gate on confidence.
+    judge = FakeJudge(relations=[("supports", 0.33)])
+    result = await ground_claims(
+        text="The release adds a ranked next-action queue.",
+        kb=_EmptyKB(),
+        judge=judge,
+        repo_facts=[{"ref": "d25ca04", "excerpt": "feat: devrel next action queue"}],
+        confidence_min=0.65,
+    )
+    assert result.grounded_claims == 0
+    assert len(result.flagged) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_contradicted_claim_is_flagged_regardless_of_confidence():
+    judge = FakeJudge(relations=[("contradicts", 0.99)])
+    result = await ground_claims(
+        text="The release removes the queue.",
+        kb=_EmptyKB(),
+        judge=judge,
+        repo_facts=[{"ref": "d25ca04", "excerpt": "feat: devrel next action queue"}],
+    )
+    assert result.flagged[0].reason.startswith("Contradicted")
+
+
+@pytest.mark.asyncio
+async def test_without_a_judge_the_stage_is_skipped_never_grounded():
+    result = await ground_claims(
+        text="The release adds a queue.",
+        kb=_EmptyKB(),
+        judge=NullJudge(),
+        repo_facts=[{"ref": "d25ca04", "excerpt": "feat: queue"}],
+    )
+    assert result.judged is False
+    assert result.grounded_claims == 0
+    assert result.flagged == []
+    assert result.text_after == "The release adds a queue."

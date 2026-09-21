@@ -30,6 +30,7 @@ from typing import Any
 
 from devrel_origin.project.paths import ProjectPaths
 from devrel_origin.quality.grounding import GroundingResult, ground_claims
+from devrel_origin.quality.judgments import Judge, build_judge
 from devrel_origin.quality.persona import test_against_persona
 from devrel_origin.quality.provenance import build_provenance
 from devrel_origin.quality.readability import check_against_target, compute_readability
@@ -220,9 +221,10 @@ async def _grounding_stage(
     *,
     text: str,
     project_paths: ProjectPaths,
-    llm_client,
+    judge: Judge,
     repo_facts: list[dict[str, Any]] | None,
     cut_unsourced: bool,
+    confidence_min: float = 0.65,
 ) -> tuple[str, StageResult, GroundingResult]:
     """Optional stage: verify factual claims against the KB + repo facts.
 
@@ -238,10 +240,25 @@ async def _grounding_stage(
     gr = await ground_claims(
         text=text,
         kb=kb,
-        llm_client=llm_client,
+        judge=judge,
         repo_facts=repo_facts,
         cut_unsourced=cut_unsourced,
+        confidence_min=confidence_min,
     )
+    if not gr.judged:
+        # Not a pass. There is no deterministic equivalent of grounding, so
+        # without a backend the stage reports that it did not run.
+        return (
+            text,
+            StageResult(
+                name="grounding",
+                text_before=text,
+                text_after=text,
+                duration_s=round(time.monotonic() - t0, 3),
+                detail="skipped: no judgment backend",
+            ),
+            gr,
+        )
     issues = [f"Unsourced: {c.claim.text}" for c in gr.flagged]
     sr = StageResult(
         name="grounding",
@@ -250,7 +267,9 @@ async def _grounding_stage(
         duration_s=round(time.monotonic() - t0, 3),
         issues=issues,
         detail=(
-            f"{gr.grounded_claims}/{gr.total_claims} grounded" + (", cut" if gr.cut_applied else "")
+            f"{gr.grounded_claims}/{gr.total_claims} grounded"
+            + (", cut" if gr.cut_applied else "")
+            + f", judged_by={judge.backend}"
         ),
     )
     return gr.text_after, sr, gr
@@ -285,6 +304,7 @@ async def run_pipeline(
         if project_paths.slop_file.is_file()
         else ""
     )
+    judge = build_judge()
 
     # Fail-fast on unknown content_type before any LLM spend.
     get_targets(content_type, style_md)
@@ -402,7 +422,7 @@ async def run_pipeline(
         text, grounding_sr, grounding_result = await _grounding_stage(
             text=text,
             project_paths=project_paths,
-            llm_client=llm_client,
+            judge=judge,
             repo_facts=repo_facts,
             cut_unsourced=cut_unsourced,
         )

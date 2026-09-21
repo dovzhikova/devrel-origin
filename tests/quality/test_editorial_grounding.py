@@ -2,6 +2,8 @@
 
 Grounding is OFF by default (adds latency/cost). These tests confirm the flag
 gates the stage, the stage flags unsourced claims, and provenance is attached.
+The judgment backend is provided by monkeypatching ``build_judge`` (called
+once inside ``run_pipeline``) with a ``FakeJudge``, so no network call is made.
 """
 
 from __future__ import annotations
@@ -11,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from devrel_origin.project.paths import ProjectPaths
+from devrel_origin.quality import editorial
 from devrel_origin.quality.editorial import run_pipeline
+from tests.quality.fakes import FakeJudge
 
 
 def _project(tmp_path) -> ProjectPaths:
@@ -30,8 +34,9 @@ def _project(tmp_path) -> ProjectPaths:
     return ProjectPaths.from_root(tmp_path)
 
 
-def _client(*, extract_json: str = "[]", adjudications: list[str] | None = None):
-    """Mock covering editorial stages, slop lint, persona, and grounding."""
+def _client():
+    """LLM mock covering editorial stages, slop lint, and persona (not grounding:
+    grounding now goes through the judge port, patched separately per test)."""
     client = MagicMock()
     client.set_agent = MagicMock()
     client.generate_with_revision = AsyncMock(
@@ -40,17 +45,12 @@ def _client(*, extract_json: str = "[]", adjudications: list[str] | None = None)
             MagicMock(final_score=8, revision_rounds=0, critiques=[]),
         )
     )
-    adj_iter = iter(adjudications or [])
 
     async def _generate(*, system_prompt, user_prompt, model, **kwargs):
         if "screening AI-written content" in system_prompt:  # slop lint
             return ""
         if "skeptical senior backend developer" in system_prompt:  # persona
             return '{"score": 8, "weak_sections": [], "feedback": "solid"}'
-        if "extract discrete" in system_prompt:  # grounding extract
-            return extract_json
-        if "fact-checker" in system_prompt:  # grounding adjudicate
-            return next(adj_iter)
         return ""
 
     client.generate = AsyncMock(side_effect=_generate)
@@ -58,7 +58,8 @@ def _client(*, extract_json: str = "[]", adjudications: list[str] | None = None)
 
 
 @pytest.mark.asyncio
-async def test_grounding_off_by_default(tmp_path):
+async def test_grounding_off_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(editorial, "build_judge", lambda: FakeJudge())
     paths = _project(tmp_path)
     client = _client()
     result = await run_pipeline(
@@ -71,19 +72,21 @@ async def test_grounding_off_by_default(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_grounding_on_adds_stage_and_provenance(tmp_path):
+async def test_grounding_on_adds_stage_and_provenance(tmp_path, monkeypatch):
+    # One claim (the pipeline's fixed final text), verified as grounded
+    # against a repo fact (repo facts are candidates for every claim,
+    # independent of KB overlap).
+    judge = FakeJudge(relations=[("supports", 0.9)])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
     paths = _project(tmp_path)
-    # One claim, adjudicated grounded to KB source index 0.
-    client = _client(
-        extract_json='[{"text": "auto-instruments for OpenTelemetry", "kind": "capability"}]',
-        adjudications=['{"grounded": true, "source_indexes": [0], "reason": "kb"}'],
-    )
+    client = _client()
     result = await run_pipeline(
         initial_draft="x",
         content_type="landing_page",
         project_paths=paths,
         llm_client=client,
         ground=True,
+        repo_facts=[{"ref": "commit:abc123", "excerpt": "feat: add OTel export"}],
     )
     stage_names = [s.name for s in result.stages]
     assert "grounding" in stage_names
@@ -93,12 +96,12 @@ async def test_grounding_on_adds_stage_and_provenance(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unsourced_claim_flags_artifact(tmp_path):
+async def test_unsourced_claim_flags_artifact(tmp_path, monkeypatch):
+    # No candidate sources at all: flagged without consuming a relation.
+    judge = FakeJudge()
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
     paths = _project(tmp_path)
-    client = _client(
-        extract_json='[{"text": "used by NASA", "kind": "fact"}]',
-        adjudications=['{"grounded": false, "source_indexes": [], "reason": "no source"}'],
-    )
+    client = _client()
     result = await run_pipeline(
         initial_draft="x",
         content_type="landing_page",
@@ -112,12 +115,11 @@ async def test_unsourced_claim_flags_artifact(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_repo_facts_flow_into_grounding(tmp_path):
+async def test_repo_facts_flow_into_grounding(tmp_path, monkeypatch):
+    judge = FakeJudge(relations=[("supports", 0.9)])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
     paths = _project(tmp_path)
-    client = _client(
-        extract_json='[{"text": "we shipped OTel export", "kind": "capability"}]',
-        adjudications=['{"grounded": true, "source_indexes": [0], "reason": "commit"}'],
-    )
+    client = _client()
     result = await run_pipeline(
         initial_draft="x",
         content_type="landing_page",
@@ -127,3 +129,22 @@ async def test_repo_facts_flow_into_grounding(tmp_path):
         repo_facts=[{"ref": "commit:abc123", "excerpt": "feat: add OTel export"}],
     )
     assert result.provenance["grounding_summary"]["grounded_claims"] == 1
+
+
+@pytest.mark.asyncio
+async def test_grounding_skipped_without_a_judge_backend(tmp_path, monkeypatch):
+    from devrel_origin.quality.judgments import NullJudge
+
+    monkeypatch.setattr(editorial, "build_judge", lambda: NullJudge())
+    paths = _project(tmp_path)
+    client = _client()
+    result = await run_pipeline(
+        initial_draft="x",
+        content_type="landing_page",
+        project_paths=paths,
+        llm_client=client,
+        ground=True,
+    )
+    grounding_stage = next(s for s in result.stages if s.name == "grounding")
+    assert grounding_stage.detail == "skipped: no judgment backend"
+    assert result.flagged is False
