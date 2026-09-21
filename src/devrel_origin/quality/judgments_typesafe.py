@@ -87,8 +87,16 @@ class TypeSafeJudge:
                 relation=UNAVAILABLE, confidence=0.0, available=False, backend=BACKEND
             )
 
-    async def select_claims(self, *, sentences: list[str]) -> list[float]:
-        """One `is_factual_claim` Noul per sentence, batched into one request."""
+    async def select_claims(self, *, sentences: list[str]) -> list[float] | None:
+        """One `is_factual_claim` Noul per sentence, batched into one request.
+
+        Returns ``None`` when any chunked request failed, including a partial
+        failure after earlier chunks succeeded. A padded 0.0 per failed
+        sentence would be indistinguishable from a real "not a claim"
+        judgment, and a caller (``grounding.ground_claims``) must be able to
+        tell "we determined this" from "we never asked" so it can fall back
+        instead of silently scoring zero claims.
+        """
         self._reset_usage()
         from typesafe_sdk import Noul
 
@@ -106,7 +114,7 @@ class TypeSafeJudge:
                 out.extend(float(resp.nouls[n].noul) for n in names)
             except Exception as exc:
                 logger.warning("judge_select_claims_failed", extra={"error": str(exc)})
-                out.extend(0.0 for _ in batch)
+                return None
         return out
 
     async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:

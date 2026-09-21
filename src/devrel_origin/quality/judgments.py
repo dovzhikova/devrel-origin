@@ -48,7 +48,7 @@ class Judge(Protocol):
     available: bool
     backend: str
 
-    async def select_claims(self, *, sentences: list[str]) -> list[float]: ...
+    async def select_claims(self, *, sentences: list[str]) -> list[float] | None: ...
 
     async def verify_claim(self, *, claim: str, evidence: str) -> ClaimVerdict: ...
 
@@ -61,7 +61,7 @@ class NullJudge:
     available = False
     backend = "none"
 
-    async def select_claims(self, *, sentences: list[str]) -> list[float]:
+    async def select_claims(self, *, sentences: list[str]) -> list[float] | None:
         return [0.0 for _ in sentences]
 
     async def verify_claim(self, *, claim: str, evidence: str) -> ClaimVerdict:
@@ -144,7 +144,7 @@ class _CostSinkJudge:
         except Exception as exc:
             logger.warning("judgment_cost_sink_failed", extra={"error": str(exc)})
 
-    async def select_claims(self, *, sentences: list[str]) -> list[float]:
+    async def select_claims(self, *, sentences: list[str]) -> list[float] | None:
         result = await self._judge.select_claims(sentences=sentences)
         await self._emit()
         return result

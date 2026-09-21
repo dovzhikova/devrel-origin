@@ -28,7 +28,7 @@ class FakeJudge:
         if self._usage is not None:
             self.last_usage = dict(self._usage)
 
-    async def select_claims(self, *, sentences: list[str]) -> list[float]:
+    async def select_claims(self, *, sentences: list[str]) -> list[float] | None:
         if self.claim_probs is None:
             result = [1.0 for _ in sentences]
         else:

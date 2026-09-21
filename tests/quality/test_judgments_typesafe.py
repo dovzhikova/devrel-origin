@@ -178,6 +178,44 @@ async def test_a_failed_request_degrades_only_its_own_units():
 
 
 @pytest.mark.asyncio
+async def test_select_claims_returns_none_on_a_service_failure():
+    class _Boom:
+        async def system_one(self, state, questions, **kwargs):
+            raise RuntimeError("503 from the service")
+
+    judge = TypeSafeJudge(api_key="sk-test", client=_Boom())
+
+    result = await judge.select_claims(sentences=["a.", "b."])
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_select_claims_returns_none_on_a_partial_chunk_failure():
+    # A partial failure must not degrade to a partial list padded with 0.0:
+    # that reads identically to "these sentences are not claims," which a
+    # caller cannot tell apart from a real judgment.
+    class _PartialFailClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def system_one(self, state, questions, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                names = list(state)
+                return _Resp(nouls={n: _Noul(0.9) for n in names})
+            raise RuntimeError("503 from the service")
+
+    judge = TypeSafeJudge(
+        api_key="sk-test", client=_PartialFailClient(), max_questions_per_request=1
+    )
+
+    result = await judge.select_claims(sentences=["a.", "b.", "c."])
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_last_usage_sums_tokens_across_chunked_requests_then_resets_on_next_call():
     client = _StubClient(
         [

@@ -108,7 +108,7 @@ class _FakeUsageJudge:
         self._usages = list(usages)
         self.last_usage = None
 
-    async def select_claims(self, *, sentences: list[str]) -> list[float]:
+    async def select_claims(self, *, sentences: list[str]) -> list[float] | None:
         self.last_usage = self._usages.pop(0)
         return [0.0 for _ in sentences]
 
