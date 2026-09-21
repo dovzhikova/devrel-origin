@@ -135,12 +135,27 @@ async def test_repo_facts_flow_into_grounding(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grounding_skipped_without_a_judge_backend(tmp_path, monkeypatch):
+async def test_grounding_falls_back_to_haiku_without_a_judge_backend(tmp_path, monkeypatch):
+    # Task 5b: run_pipeline always has an llm_client, so a missing typed judge
+    # no longer means "skipped" at this layer. It falls back to Haiku, the
+    # same llm_client already wired through the other editorial stages.
     from devrel_origin.quality.judgments import NullJudge
 
     monkeypatch.setattr(editorial, "build_judge", lambda: NullJudge())
     paths = _project(tmp_path)
     client = _client()
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "screening AI-written content" in system_prompt:  # slop lint
+            return ""
+        if "skeptical senior backend developer" in system_prompt:  # persona
+            return '{"score": 8, "weak_sections": [], "feedback": "solid"}'
+        if "extract discrete" in system_prompt:  # grounding: Haiku extraction
+            return "[]"
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
     result = await run_pipeline(
         initial_draft="x",
         content_type="landing_page",
@@ -149,7 +164,8 @@ async def test_grounding_skipped_without_a_judge_backend(tmp_path, monkeypatch):
         ground=True,
     )
     grounding_stage = next(s for s in result.stages if s.name == "grounding")
-    assert grounding_stage.detail == "skipped: no judgment backend"
+    assert "judged_by=haiku" in grounding_stage.detail
+    assert result.provenance["grounding_summary"]["backend"] == "haiku"
     assert result.flagged is False
 
 
