@@ -123,8 +123,17 @@ def cost_command(
         typer.echo(json.dumps(payload, indent=2))
         return
 
+    total_has_priced = any(f["has_priced"] for f in agent_priced_flags.values())
+    total_has_unpriced = bool(unpriced_by_model)
+    if total_has_unpriced and not total_has_priced:
+        total_display = "n/a"
+    elif total_has_unpriced:
+        total_display = f"${total_usd:.4f} + n/a"
+    else:
+        total_display = f"${total_usd:.4f}"
+
     suffix = f" for {month}" if month else ""
-    console.print(f"[bold]Total{suffix}:[/bold] ${total_usd:.4f}  [dim]({calls} call(s))[/dim]")
+    console.print(f"[bold]Total{suffix}:[/bold] {total_display}  [dim]({calls} call(s))[/dim]")
     if not by_agent:
         console.print("[dim]No cost rows yet.[/dim]")
         return

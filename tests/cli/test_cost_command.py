@@ -65,6 +65,41 @@ def _seed_mixed_costs(tmp_path):
     return 0.0105
 
 
+def _seed_all_unpriced_cost(tmp_path):
+    """Seed a single unpriced row; no priced calls recorded at all."""
+    db_path = tmp_path / ".devrel" / "state.db"
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO costs (agent, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("quality", "typesafe:jev", 1314, 158, 0, 0, 0.0),
+        )
+        conn.commit()
+
+
+def _seed_mixed_single_agent_cost(tmp_path):
+    """Seed ONE agent with both a priced row and an unpriced row."""
+    db_path = tmp_path / ".devrel" / "state.db"
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO costs (agent, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("quality", "claude-sonnet-4-5-20250929", 1000, 500, 0, 0, 0.0105),
+        )
+        conn.execute(
+            "INSERT INTO costs (agent, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("quality", "typesafe:jev", 1314, 158, 0, 0, 0.0),
+        )
+        conn.commit()
+    return 0.0105
+
+
 def test_cost_unpriced_agent_shows_na_not_zero(tmp_path):
     cwd = os.getcwd()
     os.chdir(tmp_path)
@@ -111,3 +146,44 @@ def test_cost_json_unpriced_block(tmp_path):
     assert data["unpriced"]["typesafe:jev"]["output_tokens"] == 158
     assert data["unpriced"]["typesafe:jev"]["calls"] == 1
     assert data["total_usd"] == priced_cost
+
+
+def test_cost_total_line_all_unpriced_shows_na(tmp_path):
+    """Finding 1: the Total line must not read $0.00 when every recorded
+    call is on an unpriced model. It follows the same n/a rule as agent
+    rows."""
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        _init(tmp_path)
+        _seed_all_unpriced_cost(tmp_path)
+    finally:
+        os.chdir(cwd)
+
+    result = _run_in(tmp_path, "cost")
+    assert result.exit_code == 0, result.output
+    assert "$0.00" not in result.output
+    total_line = next(line for line in result.output.splitlines() if line.startswith("Total"))
+    assert "n/a" in total_line
+
+
+def test_cost_mixed_agent_and_total_show_priced_sum_plus_na(tmp_path):
+    """Finding 2: an agent mixing a priced and an unpriced call shows its
+    priced sum plus a `+ n/a` marker, and the Total line (which also mixes
+    priced and unpriced spend here) carries the same marker."""
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        _init(tmp_path)
+        priced_cost = _seed_mixed_single_agent_cost(tmp_path)
+    finally:
+        os.chdir(cwd)
+
+    result = _run_in(tmp_path, "cost")
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    total_line = next(line for line in lines if line.startswith("Total"))
+    quality_line = next(line for line in lines if "quality" in line)
+    marker = f"${priced_cost:.4f} + n/a"
+    assert marker in total_line
+    assert marker in quality_line
