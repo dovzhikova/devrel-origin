@@ -150,3 +150,26 @@ def test_render_pr_summary_pass_badge_fully_judged_zero_flags_zero_skips():
     assert prov["grounded_ok"] is True
     md = render_pr_summary(prov)
     assert "Grounding: PASS" in md
+
+
+def test_render_pr_summary_names_the_backend():
+    grounding = {
+        **_GROUNDING,
+        "flagged_count": 0,
+        "flagged": [],
+        "judged": True,
+        "skipped_count": 0,
+        "backend": "haiku",
+    }
+    prov = build_provenance(content_type="hero", stages=_STAGES, grounding=grounding)
+    md = render_pr_summary(prov)
+    assert "judged by haiku" in md
+
+
+def test_render_pr_summary_skipped_badge_omits_backend_line():
+    # judged=False means the stage never ran at all (backend "none"); the
+    # summary should not claim a backend judged anything.
+    grounding = {**_GROUNDING, "flagged_count": 0, "flagged": [], "judged": False}
+    prov = build_provenance(content_type="hero", stages=_STAGES, grounding=grounding)
+    md = render_pr_summary(prov)
+    assert "judged by" not in md

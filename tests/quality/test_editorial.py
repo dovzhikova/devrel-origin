@@ -249,3 +249,49 @@ async def test_revision_trace_is_serializable(tmp_path):
     parsed = json.loads(serialized)
     assert "stages" in parsed
     assert "content_type" in parsed
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_grounding_falls_back_to_haiku_and_names_it_in_the_summary(
+    tmp_path, monkeypatch
+):
+    # No TYPESAFE_API_KEY, so build_judge() returns NullJudge and grounding
+    # must fall back to the llm_client Task 5b restores.
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    paths = _project(tmp_path)
+    client = _mock_client_for_clean_run()
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "screening AI-written content" in system_prompt:
+            return ""
+        if "skeptical senior backend developer" in system_prompt:
+            return '{"score": 8, "weak_sections": [], "feedback": "solid"}'
+        if "rewrite editor" in system_prompt:
+            return "rewritten"
+        if "extract discrete" in system_prompt:
+            return '[{"text": "It ships a ranked next-action queue.", "kind": "capability"}]'
+        if "fact-checker" in system_prompt:
+            return '{"grounded": true, "source_indexes": [0], "reason": "commit shows it"}'
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    result = await run_pipeline(
+        initial_draft="A clear sharp opening sentence about the product. "
+        "It ships a ranked next-action queue.",
+        content_type="tutorial",
+        project_paths=paths,
+        llm_client=client,
+        ground=True,
+        repo_facts=[{"ref": "d25ca04", "excerpt": "feat: ranked next-action queue"}],
+    )
+
+    grounding_dict = result.revision_trace["grounding"]
+    assert grounding_dict["backend"] == "haiku"
+    grounding_stage = next(s for s in result.stages if s.name == "grounding")
+    assert "judged_by=haiku" in grounding_stage.detail
+
+    from devrel_origin.quality.provenance import render_pr_summary
+
+    summary = render_pr_summary(result.provenance)
+    assert "judged by haiku" in summary

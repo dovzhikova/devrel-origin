@@ -222,6 +222,7 @@ async def _grounding_stage(
     text: str,
     project_paths: ProjectPaths,
     judge: Judge,
+    llm_client,
     repo_facts: list[dict[str, Any]] | None,
     cut_unsourced: bool,
     confidence_min: float = 0.65,
@@ -241,6 +242,7 @@ async def _grounding_stage(
         text=text,
         kb=kb,
         judge=judge,
+        llm_client=llm_client,
         repo_facts=repo_facts,
         cut_unsourced=cut_unsourced,
         confidence_min=confidence_min,
@@ -274,7 +276,7 @@ async def _grounding_stage(
             f"{gr.grounded_claims}/{gr.total_claims} grounded"
             + (", cut" if gr.cut_applied else "")
             + (f", {len(gr.skipped)} not judged" if gr.skipped else "")
-            + f", judged_by={judge.backend}"
+            + f", judged_by={gr.backend}"
         ),
     )
     return gr.text_after, sr, gr
@@ -434,6 +436,7 @@ async def run_pipeline(
             text=text,
             project_paths=project_paths,
             judge=judge,
+            llm_client=llm_client,
             repo_facts=repo_facts,
             cut_unsourced=cut_unsourced,
         )

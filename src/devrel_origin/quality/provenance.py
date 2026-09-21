@@ -89,6 +89,7 @@ def build_provenance(
             "cut_applied": grounding.get("cut_applied", False),
             "judged": judged,
             "skipped_count": skipped_count,
+            "backend": grounding.get("backend", "none"),
         }
     else:
         grounded_ok = False
@@ -171,10 +172,12 @@ def render_pr_summary(provenance: dict[str, Any]) -> str:
         else:
             badge = "PASS" if provenance.get("grounded_ok") else "FLAGGED"
         lines.append(f"### Grounding: {badge}")
+        backend = gs.get("backend", "none")
         lines.append(
             f"{gs.get('grounded_claims', 0)}/{gs.get('total_claims', 0)} claims sourced"
             + (f", {gs.get('flagged_count', 0)} unsourced" if gs.get("flagged_count") else "")
             + (" (cut)" if gs.get("cut_applied") else "")
+            + (f", judged by {backend}" if judged and backend != "none" else "")
         )
         lines.append("")
 
