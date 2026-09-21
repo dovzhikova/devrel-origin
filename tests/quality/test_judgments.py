@@ -31,6 +31,27 @@ async def test_null_judge_returns_one_unavailable_verdict_per_unit():
     assert [v.unit_index for v in verdicts] == [0, 1, 2]
     assert all(v.available is False for v in verdicts)
     assert all(v.pattern == PATTERN_NONE for v in verdicts)
+    assert all(v.probabilities is None for v in verdicts)
+
+
+def test_pattern_verdict_probabilities_defaults_to_none_for_old_callers():
+    verdict = PatternVerdict(
+        unit_index=0, pattern=PATTERN_NONE, confidence=0.0, available=True, backend="fake"
+    )
+    assert verdict.probabilities is None
+
+
+def test_pattern_verdict_probabilities_carries_every_pattern_when_given():
+    probs = {"binary_contrast": 0.2, "colon_reveal": 0.9}
+    verdict = PatternVerdict(
+        unit_index=0,
+        pattern="colon_reveal",
+        confidence=0.9,
+        available=True,
+        backend="fake",
+        probabilities=probs,
+    )
+    assert verdict.probabilities == probs
 
 
 @pytest.mark.asyncio

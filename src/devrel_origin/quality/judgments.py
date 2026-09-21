@@ -41,6 +41,7 @@ class PatternVerdict:
     confidence: float
     available: bool
     backend: str
+    probabilities: dict[str, float] | None = None
 
 
 class Judge(Protocol):
