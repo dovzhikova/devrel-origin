@@ -30,7 +30,17 @@ from devrel_origin.quality.grounding import (
     ground_claims,
 )
 from devrel_origin.quality.judgments import UNAVAILABLE, NullJudge
+from devrel_origin.quality.judgments_typesafe import TypeSafeJudge
+from devrel_origin.quality.provenance import build_provenance, render_pr_summary
 from tests.quality.fakes import FakeJudge
+
+
+class _BoomClient:
+    """Stands in for a TypeSafe client whose every request fails (bad key,
+    outage). No SDK import, no network."""
+
+    async def system_one(self, state, questions, **kwargs):
+        raise RuntimeError("401 invalid key")
 
 
 def _haiku_client(extract_json: str, adjudications: list[str]):
@@ -274,9 +284,16 @@ def test_coerce_claims_parses_json_list():
 
 
 def test_coerce_claims_tolerates_fences_and_junk():
-    assert _coerce_claims("```json\nnot json\n```") == []
-    assert _coerce_claims("total garbage") == []
-    assert _coerce_claims('{"not": "a list"}') == []
+    # Contract change (FINAL REVIEW fix): unparseable / wrong-shape replies
+    # return None, an explicit "could not parse" signal, never a bare [] that
+    # would read identically to "the model found zero real claims."
+    assert _coerce_claims("```json\nnot json\n```") is None
+    assert _coerce_claims("total garbage") is None
+    assert _coerce_claims('{"not": "a list"}') is None
+
+
+def test_coerce_claims_a_valid_empty_list_is_not_a_parse_failure():
+    assert _coerce_claims("[]") == []
 
 
 def test_coerce_claims_defaults_unknown_kind_to_fact():
@@ -386,3 +403,72 @@ async def test_haiku_unparseable_adjudication_is_skipped_not_flagged_and_still_c
     assert result.skipped[0].claim.text == "Used by NASA."
     assert result.cut_applied is False
     assert "Used by NASA." in result.text_after
+
+
+# --- FINAL REVIEW fixes: a select_claims failure must never read as a pass --
+
+
+@pytest.mark.asyncio
+async def test_typesafe_select_claims_failure_falls_back_to_haiku(tmp_path):
+    # Reproduces the FINAL REVIEW critical finding: TypeSafeJudge.select_claims
+    # failing entirely must not silently score 0 claims and PASS. With an
+    # llm_client available, grounding falls back to Haiku and actually judges
+    # the real claims in the text.
+    judge = TypeSafeJudge(api_key="bad", client=_BoomClient())
+    text = "X supports OpenTelemetry. X cuts build time by 40 percent."
+    extract = (
+        '[{"text": "X supports OpenTelemetry.", "kind": "capability"}, '
+        '{"text": "X cuts build time by 40 percent.", "kind": "metric"}]'
+    )
+    adj = [
+        '{"grounded": false, "source_indexes": [], "reason": "no source"}',
+        '{"grounded": false, "source_indexes": [], "reason": "no source"}',
+    ]
+    client = _haiku_client(extract, adj)
+
+    result = await ground_claims(text=text, kb=_EmptyKB(), judge=judge, llm_client=client)
+
+    assert result.backend == "haiku"
+    assert result.judged is True
+    assert result.total_claims == 2
+    assert len(result.flagged) == 2
+    render = render_pr_summary(
+        build_provenance(content_type="blog_post", stages=[], grounding=result.to_dict())
+    )
+    assert "PASS" not in render
+
+
+@pytest.mark.asyncio
+async def test_typesafe_select_claims_failure_without_llm_client_is_not_judged(tmp_path):
+    judge = TypeSafeJudge(api_key="bad", client=_BoomClient())
+    text = "X supports OpenTelemetry. X cuts build time by 40 percent."
+
+    result = await ground_claims(text=text, kb=_EmptyKB(), judge=judge)
+
+    assert result.judged is False
+    assert result.backend == "none"
+    assert result.total_claims == 0
+    assert result.text_after == text
+    render = render_pr_summary(
+        build_provenance(content_type="blog_post", stages=[], grounding=result.to_dict())
+    )
+    assert "PASS" not in render
+    assert "SKIPPED" in render
+
+
+@pytest.mark.asyncio
+async def test_haiku_unparseable_extraction_is_not_judged(tmp_path):
+    kb = _kb(tmp_path)
+    client = _haiku_client("not valid json at all", [])
+
+    result = await ground_claims(
+        text="Some draft text goes here today.", kb=kb, judge=NullJudge(), llm_client=client
+    )
+
+    assert result.judged is False
+    assert result.backend == "haiku"
+    render = render_pr_summary(
+        build_provenance(content_type="blog_post", stages=[], grounding=result.to_dict())
+    )
+    assert "PASS" not in render
+    assert "SKIPPED" in render

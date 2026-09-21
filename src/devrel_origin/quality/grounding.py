@@ -15,9 +15,15 @@ Backend selection, tried in this order:
 1. A typed judgment backend (``Judge.available`` is True): sentences are split
    deterministically, claim selection and verification both go through the
    typed judgment port (``Judge.select_claims`` / ``Judge.verify_claim``).
-   ``llm_client`` is ignored when this path is taken.
-2. Otherwise, an ``llm_client``: Haiku extracts claims and adjudicates each
-   one against candidate sources with two prompted calls per claim.
+   ``llm_client`` is not consulted while this path succeeds. If claim
+   selection itself fails entirely (``select_claims`` returns ``None``: any
+   request error, including a partial failure of a chunked call), that is
+   NOT "zero claims" and does not render a pass; it falls through to step 2.
+2. Otherwise (no typed judge, or its claim selection just failed), an
+   ``llm_client``: Haiku extracts claims and adjudicates each one against
+   candidate sources with two prompted calls per claim. If Haiku's own claim
+   extraction reply cannot be parsed, that is also NOT "zero claims"; the
+   draft is reported ``judged=False``, exactly like step 3.
 3. Otherwise: the stage does not run. It reports ``judged=False``, grounds
    nothing, flags nothing, and leaves the text untouched.
 
@@ -135,10 +141,15 @@ _EXTRACT_SYSTEM = (
 )
 
 
-def _coerce_claims(raw: str) -> list[Claim]:
-    """Parse the extractor's JSON into Claim objects. Tolerant of fences /
-    junk: on any parse failure, return an empty list so grounding degrades to
-    a no-op rather than crashing the pipeline."""
+def _coerce_claims(raw: str) -> list[Claim] | None:
+    """Parse the extractor's JSON into Claim objects. Tolerant of fences.
+
+    Returns ``None`` when the reply could not be interpreted as a claims
+    list at all (a JSON parse failure, or valid JSON that is not a list): an
+    explicit "could not parse" signal, distinct from a valid empty list
+    (``[]``), which means the model genuinely found no checkable claims. The
+    caller must not treat the two the same, or a parse failure silently
+    reads as "zero claims, nothing to flag."""
     text = raw.strip()
     if text.startswith("```"):
         # Strip a leading/trailing fence if the model added one.
@@ -149,9 +160,9 @@ def _coerce_claims(raw: str) -> list[Claim]:
         data = json.loads(text)
     except json.JSONDecodeError:
         logger.info("grounding_extract_unparseable", extra={"raw_head": raw[:120]})
-        return []
+        return None
     if not isinstance(data, list):
-        return []
+        return None
     claims: list[Claim] = []
     valid_kinds = {"metric", "capability", "comparison", "fact"}
     for item in data:
@@ -167,7 +178,7 @@ def _coerce_claims(raw: str) -> list[Claim]:
     return claims
 
 
-async def _extract_claims(text: str, llm_client) -> list[Claim]:
+async def _extract_claims(text: str, llm_client) -> list[Claim] | None:
     raw = await llm_client.generate(
         system_prompt=_EXTRACT_SYSTEM,
         user_prompt="Draft:\n\n" + text,
@@ -362,10 +373,12 @@ async def ground_claims(
         kb: A ``KnowledgeBaseSearch`` over the project's harvested KB.
         judge: The typed judgment port. When ``judge.available`` is True, this
             path is used and ``llm_client`` is ignored entirely.
-        llm_client: Fallback LLM client (Haiku), used only when ``judge`` is
-            unavailable. When both ``judge`` is unavailable and
-            ``llm_client`` is None, the stage does not run: it returns
-            ``judged=False`` and leaves ``text`` untouched.
+        llm_client: Fallback LLM client (Haiku), used when ``judge`` is
+            unavailable, or when it is available but its claim selection
+            fails entirely. When neither an available judge's selection nor
+            ``llm_client`` produces a usable result (including an
+            unparseable Haiku extraction), the stage does not run: it
+            returns ``judged=False`` and leaves ``text`` untouched.
         repo_facts: Pre-fetched repo facts (commits / stats) as dicts with
             ``ref`` and ``excerpt``. Fetch once via ``github_tools`` and reuse.
         cut_unsourced: When True, delete flagged (unsourced) claim sentences
@@ -383,27 +396,51 @@ async def ground_claims(
     skipped: list[GroundedClaim] = []
     repo_sources = _repo_facts_to_sources(repo_facts)
 
+    backend: str | None = None
+    claims: list[Claim] = []
+
     if judge.available:
-        backend = "typesafe"
         sentences = _split_sentences(text)
         probs = await judge.select_claims(sentences=sentences)
-        claims = [
-            Claim(text=s, kind="fact")
-            for s, p in zip(sentences, probs, strict=True)
-            if p >= CLAIM_PROB_MIN
-        ]
-        for claim in claims:
-            candidates = _kb_candidates(claim, kb) + repo_sources
-            bucket, gc = await _verify(claim, candidates, judge, confidence_min)
-            if bucket == "grounded":
-                grounded.append(gc)
-            elif bucket == "skipped":
-                skipped.append(gc)
-            else:
-                flagged.append(gc)
-    elif llm_client is not None:
+        if probs is not None:
+            backend = "typesafe"
+            claims = [
+                Claim(text=s, kind="fact")
+                for s, p in zip(sentences, probs, strict=True)
+                if p >= CLAIM_PROB_MIN
+            ]
+            for claim in claims:
+                candidates = _kb_candidates(claim, kb) + repo_sources
+                bucket, gc = await _verify(claim, candidates, judge, confidence_min)
+                if bucket == "grounded":
+                    grounded.append(gc)
+                elif bucket == "skipped":
+                    skipped.append(gc)
+                else:
+                    flagged.append(gc)
+        # else: the typed claim selector failed entirely (any request error).
+        # That is not "zero claims": fall through to Haiku (spec order:
+        # TypeSafe, else Haiku, else skipped), never treat it as a pass.
+
+    if backend is None and llm_client is not None:
         backend = "haiku"
-        claims = await _extract_claims(text, llm_client)
+        extracted = await _extract_claims(text, llm_client)
+        if extracted is None:
+            # The extractor's reply could not be parsed: this is "we could
+            # not judge," not "there were no claims." The stage ran (Haiku
+            # was asked) but produced nothing usable, so the draft as a
+            # whole is not judged, exactly like a total backend failure.
+            return GroundingResult(
+                total_claims=0,
+                grounded_claims=0,
+                flagged=[],
+                grounded=[],
+                cut_applied=False,
+                text_after=text,
+                judged=False,
+                backend=backend,
+            )
+        claims = extracted
         for claim in claims:
             candidates = _kb_candidates(claim, kb) + repo_sources
             bucket, gc = await _adjudicate(claim, candidates, llm_client)
@@ -413,7 +450,11 @@ async def ground_claims(
                 skipped.append(gc)
             else:
                 flagged.append(gc)
-    else:
+
+    if backend is None:
+        # Neither backend produced a usable result: a failed TypeSafe
+        # selection with no llm_client to fall back to, or no backend at
+        # all. `judged=False` must never read as a pass.
         return GroundingResult(
             total_claims=0,
             grounded_claims=0,
