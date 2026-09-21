@@ -23,6 +23,7 @@ Each backend exposes:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -89,6 +90,16 @@ ANTHROPIC_MODELS: dict[str, str] = {
 }
 
 
+def _sdk_accepts_temperature(create: Any) -> bool:
+    """anthropic 1.0.0 removed `temperature` from `messages.create`; 0.125.0
+    still had it. Probe the installed SDK instead of pinning a version range,
+    so both generations work and a future SDK needs no code change here."""
+    try:
+        return "temperature" in inspect.signature(create).parameters
+    except (TypeError, ValueError):
+        return True  # cannot introspect: keep the historical behaviour
+
+
 class AnthropicBackend(LLMBackend):
     """Direct Anthropic API via the official SDK. Default backend."""
 
@@ -96,13 +107,36 @@ class AnthropicBackend(LLMBackend):
     default_model = ANTHROPIC_DEFAULT_MODEL
     cheap_model = ANTHROPIC_MODELS["haiku"]
 
-    def __init__(self, api_key: str = ""):
+    def __init__(self, api_key: str = "", client: AsyncAnthropic | None = None):
         # Empty key: pass through 'dummy' so the SDK constructs (used by tests
         # that mock out messages.create); a real call would still 401.
-        self._client = AsyncAnthropic(api_key=api_key or "dummy")
+        self._client = client or AsyncAnthropic(api_key=api_key or "dummy")
+        self._send_temperature = _sdk_accepts_temperature(self._client.messages.create)
 
     def resolve_alias(self, alias: str) -> str:
         return ANTHROPIC_MODELS.get(alias, alias)
+
+    def _create_kwargs(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        """Arguments for `messages.create`, limited to what this SDK accepts.
+        On anthropic >= 1.0 the requested temperature is dropped, because the
+        SDK no longer exposes it and passing it raises TypeError."""
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        if self._send_temperature:
+            kwargs["temperature"] = temperature
+        return kwargs
 
     async def chat(
         self,
@@ -114,11 +148,13 @@ class AnthropicBackend(LLMBackend):
         max_tokens: int,
     ) -> BackendResponse:
         response = await self._client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+            **self._create_kwargs(
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         )
         return BackendResponse(
             text=response.content[0].text,
