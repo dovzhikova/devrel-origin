@@ -82,9 +82,11 @@ geo-google = [
     "google-search-results>=2.4.2",
 ]
 
-# Typed judgments for the anti-slop and grounding gates (TypeSafe System One).
-# Without this extra (or without TYPESAFE_API_KEY) the gates fall back to the
-# deterministic regex blocklist and report themselves as skipped.
+# Typed judgments (TypeSafe System One). The anti-slop backend (judge_patterns)
+# is implemented but not wired into the pipeline; grounding is the only
+# consumer today. Without this extra (or without TYPESAFE_API_KEY), grounding
+# falls back to Haiku when an LLM client is available, otherwise it does not
+# run and reports itself unjudged.
 typesafe = [
     "typesafe-sdk>=0.7.0,<0.8.0",
 ]
