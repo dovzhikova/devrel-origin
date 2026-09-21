@@ -390,6 +390,86 @@ async def test_typed_judge_partial_unavailable_never_reports_clean(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_typed_judge_recheck_all_unavailable_falls_back_to_llm_lint_clean(
+    tmp_path, monkeypatch
+):
+    # First check: a real hit (faux_insight) triggers force_rewrite. Recheck
+    # on the rewritten text: every unit comes back unavailable, so the
+    # recheck itself falls back to llm_lint. llm_lint finds nothing, so the
+    # rewrite is accepted, not silently trusted, and the fallback is named.
+    judge = _ScriptedPatternJudge(responses=[{0: ("faux_insight", 0.9)}, {0: (UNAVAILABLE, 0.0)}])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.set_agent = MagicMock()
+    client.generate_with_revision = AsyncMock(
+        return_value=(
+            "What nobody tells you: it ships.",
+            MagicMock(final_score=8, revision_rounds=0, critiques=[]),
+        )
+    )
+    rewrite_text = "It ships a ranked action queue."
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "screening AI-written content" in system_prompt:  # llm_lint recheck
+            return ""
+        if "skeptical senior backend developer" in system_prompt:  # persona
+            return '{"score": 8, "weak_sections": [], "feedback": "ok"}'
+        if "rewrite editor" in system_prompt:  # force_rewrite
+            return rewrite_text
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    result = await run_pipeline(
+        initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+    )
+    slop_stage = next(s for s in result.stages if s.name == "anti_slop")
+    assert slop_stage.text_after == rewrite_text
+    assert "recheck via llm_lint" in slop_stage.detail
+    assert "rewrite_applied" in slop_stage.detail
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_recheck_all_unavailable_falls_back_to_llm_lint_dirty_aborts(
+    tmp_path, monkeypatch
+):
+    # Same setup, but the rewrite is regex-clean and only llm_lint (the
+    # fallback the recheck now uses) catches the remaining slop; nothing
+    # about the typed tier (which is unavailable on this recheck) can flag
+    # it. Only a working llm_lint fallback aborts here.
+    judge = _ScriptedPatternJudge(responses=[{0: ("faux_insight", 0.9)}, {0: (UNAVAILABLE, 0.0)}])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.set_agent = MagicMock()
+    client.generate_with_revision = AsyncMock(
+        return_value=(
+            "What nobody tells you: it ships.",
+            MagicMock(final_score=8, revision_rounds=0, critiques=[]),
+        )
+    )
+    dirty_rewrite = "This still ships it, honestly."
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "screening AI-written content" in system_prompt:  # llm_lint recheck
+            return "still ships it"
+        if "skeptical senior backend developer" in system_prompt:  # persona
+            return '{"score": 8, "weak_sections": [], "feedback": "ok"}'
+        if "rewrite editor" in system_prompt:  # force_rewrite: regex-clean but lint-dirty
+            return dirty_rewrite
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    with pytest.raises(AbortLoud) as exc_info:
+        await run_pipeline(
+            initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+        )
+    assert "still ships it" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
 async def test_low_persona_score_returns_to_copy_edit_once(tmp_path):
     paths = _project(tmp_path)
     client = MagicMock()

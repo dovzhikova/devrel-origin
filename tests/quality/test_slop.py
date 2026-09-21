@@ -266,7 +266,7 @@ def test_find_patterns_an_unavailable_verdict_is_never_a_hit():
     # This proves find_patterns's own contract only: a unit whose verdict is
     # unavailable never becomes a PatternHit. It says nothing about whether a
     # stage built on top of this ever reports "clean" when unavailable
-    # verdicts are present — that is _slop_stage's job, covered separately in
+    # verdicts are present: that is _slop_stage's job, covered separately in
     # tests/quality/test_editorial.py.
     verdicts = [
         PatternVerdict(
