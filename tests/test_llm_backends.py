@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -57,6 +58,50 @@ class TestAnthropicBackend:
         assert out.input_tokens == 12
         assert out.output_tokens == 7
         assert out.model == "claude-sonnet-4-5-20250929"
+
+
+class TestAnthropicSdkContract:
+    """Bind against the REAL installed SDK signature, never a mock of it.
+
+    anthropic 1.0.0 removed `temperature` from `messages.create` (0.125.0 still
+    had it). The chat test above replaces `create` with an AsyncMock, which
+    accepts any keyword, so every fresh install crashed on its first real call
+    while the suite stayed green.
+    """
+
+    def test_create_kwargs_bind_to_the_installed_sdk_signature(self):
+        b = AnthropicBackend(api_key="k")
+        kwargs = b._create_kwargs(
+            model="claude-haiku-4-5-20251001",
+            system_prompt="sys",
+            user_prompt="hi",
+            temperature=0.4,
+            max_tokens=16,
+        )
+        # Raises TypeError if the backend sends a keyword this SDK rejects.
+        inspect.signature(b._client.messages.create).bind(**kwargs)
+
+    @pytest.mark.parametrize("sdk_accepts_temperature", [True, False])
+    def test_temperature_is_sent_only_when_create_accepts_it(self, sdk_accepts_temperature):
+        async def create_0x(*, model, max_tokens, messages, system, temperature):
+            raise AssertionError("never called")
+
+        async def create_1x(*, model, max_tokens, messages, system):
+            raise AssertionError("never called")
+
+        client = MagicMock()
+        client.messages.create = create_0x if sdk_accepts_temperature else create_1x
+        b = AnthropicBackend(api_key="k", client=client)
+
+        kwargs = b._create_kwargs(
+            model="m", system_prompt="s", user_prompt="u", temperature=0.4, max_tokens=8
+        )
+
+        assert ("temperature" in kwargs) is sdk_accepts_temperature
+        if sdk_accepts_temperature:
+            assert kwargs["temperature"] == 0.4
+        assert kwargs["messages"] == [{"role": "user", "content": "u"}]
+        assert kwargs["system"] == "s"
 
 
 # --- OpenRouterBackend -----------------------------------------------------
