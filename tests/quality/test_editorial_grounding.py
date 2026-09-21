@@ -8,14 +8,16 @@ once inside ``run_pipeline``) with a ``FakeJudge``, so no network call is made.
 
 from __future__ import annotations
 
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from devrel_origin.project.paths import ProjectPaths
+from devrel_origin.project.state import init_db
 from devrel_origin.quality import editorial
 from devrel_origin.quality.editorial import run_pipeline
-from devrel_origin.quality.judgments import UNAVAILABLE
+from devrel_origin.quality.judgments import JUDGMENT_MODEL, UNAVAILABLE
 from tests.quality.fakes import FakeJudge
 
 
@@ -178,3 +180,50 @@ async def test_per_claim_skip_is_not_judged_never_cut_never_unsourced(tmp_path, 
     # The claim (the pipeline's fixed final text) must survive despite
     # cut_unsourced=True: a skip is not evidence the claim is wrong.
     assert "Clean revised text with no flagged phrases." in result.final_text
+
+
+@pytest.mark.asyncio
+async def test_state_db_present_wires_judgment_usage_into_costs_table(tmp_path, monkeypatch):
+    """The end-to-end loop this task exists for: a real state.db, a judge
+    that reports usage, and a `costs` row landing at the other end."""
+    judge = FakeJudge(relations=[("supports", 0.9)], usage={"input_tokens": 42, "output_tokens": 7})
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    init_db(paths.state_db)
+    client = _client()
+
+    await run_pipeline(
+        initial_draft="x",
+        content_type="landing_page",
+        project_paths=paths,
+        llm_client=client,
+        ground=True,
+        repo_facts=[{"ref": "commit:abc123", "excerpt": "feat: add OTel export"}],
+    )
+
+    with sqlite3.connect(paths.state_db) as conn:
+        rows = conn.execute(
+            "SELECT agent, model, input_tokens, output_tokens FROM costs"
+        ).fetchall()
+    assert rows, "expected at least one costs row from the judgment calls"
+    assert all(row == ("quality", JUDGMENT_MODEL, 42, 7) for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_no_state_db_completes_and_writes_nothing(tmp_path, monkeypatch):
+    judge = FakeJudge(relations=[("supports", 0.9)], usage={"input_tokens": 42, "output_tokens": 7})
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = _client()
+
+    result = await run_pipeline(
+        initial_draft="x",
+        content_type="landing_page",
+        project_paths=paths,
+        llm_client=client,
+        ground=True,
+        repo_facts=[{"ref": "commit:abc123", "excerpt": "feat: add OTel export"}],
+    )
+
+    assert result.provenance["grounding_ran"] is True
+    assert not paths.state_db.exists()
