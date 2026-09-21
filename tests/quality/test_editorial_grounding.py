@@ -15,6 +15,7 @@ import pytest
 from devrel_origin.project.paths import ProjectPaths
 from devrel_origin.quality import editorial
 from devrel_origin.quality.editorial import run_pipeline
+from devrel_origin.quality.judgments import UNAVAILABLE
 from tests.quality.fakes import FakeJudge
 
 
@@ -148,3 +149,32 @@ async def test_grounding_skipped_without_a_judge_backend(tmp_path, monkeypatch):
     grounding_stage = next(s for s in result.stages if s.name == "grounding")
     assert grounding_stage.detail == "skipped: no judgment backend"
     assert result.flagged is False
+
+
+@pytest.mark.asyncio
+async def test_per_claim_skip_is_not_judged_never_cut_never_unsourced(tmp_path, monkeypatch):
+    # A per-call unavailable verdict (transient backend failure) is distinct
+    # from a stage-level skip: the stage runs (judged=True) but this one claim
+    # is not judged. It must never render as "Unsourced" and must survive
+    # cut_unsourced.
+    judge = FakeJudge(relations=[(UNAVAILABLE, 0.0)])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = _client()
+    result = await run_pipeline(
+        initial_draft="x",
+        content_type="landing_page",
+        project_paths=paths,
+        llm_client=client,
+        ground=True,
+        cut_unsourced=True,
+        repo_facts=[{"ref": "commit:abc123", "excerpt": "feat: add OTel export"}],
+    )
+    grounding_stage = next(s for s in result.stages if s.name == "grounding")
+    assert any(i.startswith("Not judged:") for i in grounding_stage.issues)
+    assert not any(i.startswith("Unsourced:") for i in grounding_stage.issues)
+    assert result.provenance["grounding_summary"]["skipped_count"] == 1
+    assert result.provenance["grounded_ok"] is False
+    # The claim (the pipeline's fixed final text) must survive despite
+    # cut_unsourced=True: a skip is not evidence the claim is wrong.
+    assert "Clean revised text with no flagged phrases." in result.final_text

@@ -259,7 +259,11 @@ async def _grounding_stage(
             ),
             gr,
         )
+    # A skipped claim (verdict unavailable) is not the same finding as an
+    # unsourced one; keep them in separate issue lines so a reader (or a CI
+    # gate parsing issues) never mistakes "not judged" for "checked and bad."
     issues = [f"Unsourced: {c.claim.text}" for c in gr.flagged]
+    issues += [f"Not judged: {c.claim.text}" for c in gr.skipped]
     sr = StageResult(
         name="grounding",
         text_before=text,
@@ -269,6 +273,7 @@ async def _grounding_stage(
         detail=(
             f"{gr.grounded_claims}/{gr.total_claims} grounded"
             + (", cut" if gr.cut_applied else "")
+            + (f", {len(gr.skipped)} not judged" if gr.skipped else "")
             + f", judged_by={judge.backend}"
         ),
     )

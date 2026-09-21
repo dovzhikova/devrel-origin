@@ -22,7 +22,7 @@ from devrel_origin.quality.grounding import (
     _repo_facts_to_sources,
     ground_claims,
 )
-from devrel_origin.quality.judgments import NullJudge
+from devrel_origin.quality.judgments import UNAVAILABLE, NullJudge
 from tests.quality.fakes import FakeJudge
 
 
@@ -200,6 +200,25 @@ async def test_a_contradicted_claim_is_flagged_regardless_of_confidence():
         repo_facts=[{"ref": "d25ca04", "excerpt": "feat: devrel next action queue"}],
     )
     assert result.flagged[0].reason.startswith("Contradicted")
+
+
+@pytest.mark.asyncio
+async def test_unavailable_verdict_is_skipped_not_flagged_and_never_cut(tmp_path):
+    # A transient per-call backend failure (verdict.available is False) is a
+    # third state, distinct from grounded and flagged: the claim lands in
+    # `skipped`, and cut_unsourced never removes it, whatever it says.
+    kb = _kb(tmp_path)
+    text = "The agent auto-instruments applications for OpenTelemetry with zero code changes."
+    judge = FakeJudge(relations=[(UNAVAILABLE, 0.0)])
+
+    result = await ground_claims(text=text, kb=kb, judge=judge, cut_unsourced=True)
+
+    assert result.grounded == []
+    assert result.flagged == []
+    assert len(result.skipped) == 1
+    assert result.skipped[0].reason == "Judgment skipped."
+    assert result.cut_applied is False
+    assert result.text_after == text
 
 
 @pytest.mark.asyncio

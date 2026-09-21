@@ -1,6 +1,6 @@
 """Test doubles for the judgment port. Used by the grounding and slop tests."""
 
-from devrel_origin.quality.judgments import ClaimVerdict, PatternVerdict
+from devrel_origin.quality.judgments import UNAVAILABLE, ClaimVerdict, PatternVerdict
 from devrel_origin.quality.questions import PATTERN_NONE
 
 
@@ -25,8 +25,11 @@ class FakeJudge:
     async def verify_claim(self, *, claim: str, evidence: str) -> ClaimVerdict:
         self.claims_seen.append((claim, evidence))
         relation, confidence = self.relations.pop(0) if self.relations else ("says_nothing", 0.9)
+        # A scripted relation of UNAVAILABLE simulates a per-call backend
+        # failure (transient), distinct from the class-level `available`.
+        available = relation != UNAVAILABLE
         return ClaimVerdict(
-            relation=relation, confidence=confidence, available=True, backend=self.backend
+            relation=relation, confidence=confidence, available=available, backend=self.backend
         )
 
     async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:

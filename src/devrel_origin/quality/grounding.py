@@ -28,6 +28,15 @@ fallback. With ``NullJudge`` (no judgment backend configured), the stage does
 not substitute a lesser check; it reports ``judged=False``, grounds nothing,
 flags nothing, and leaves the text untouched.
 
+"Not judged" is a third state, distinct from "pass" and from "flagged," at
+both the per-claim and the per-draft level. A single claim can also come back
+unjudged even when the stage as a whole ran: ``Judge.verify_claim`` can return
+``available=False`` for one call (a transient backend failure) while the
+class-level ``judge.available`` stays True. That claim goes into
+``GroundingResult.skipped``, never into ``flagged``, and is never cut by
+``cut_unsourced`` (a skip is not evidence the claim is wrong; deleting it on
+a backend hiccup would be worse than leaving it flagged for a human).
+
 The output ``GroundingResult`` is JSON-serializable and feeds the provenance
 trail (see ``quality.provenance``).
 """
@@ -86,7 +95,8 @@ class GroundingResult:
     grounded: list[GroundedClaim]  # sourced claims (with citations)
     cut_applied: bool  # whether unsourced claims were removed from the text
     text_after: str
-    judged: bool = True  # False when no judgment backend was available
+    judged: bool = True  # False when no judgment backend was available (stage-level)
+    skipped: list[GroundedClaim] = field(default_factory=list)  # per-claim: verdict unavailable
 
     def to_dict(self) -> dict:
         """JSON-serializable view for the provenance trail."""
@@ -94,10 +104,12 @@ class GroundingResult:
             "total_claims": self.total_claims,
             "grounded_claims": self.grounded_claims,
             "flagged_count": len(self.flagged),
+            "skipped_count": len(self.skipped),
             "cut_applied": self.cut_applied,
             "judged": self.judged,
             "flagged": [_grounded_claim_dict(c) for c in self.flagged],
             "grounded": [_grounded_claim_dict(c) for c in self.grounded],
+            "skipped": [_grounded_claim_dict(c) for c in self.skipped],
         }
 
 
@@ -144,27 +156,34 @@ def _repo_facts_to_sources(repo_facts: list[dict] | None) -> list[Source]:
     return out
 
 
+# Which bucket a verified claim belongs in: "grounded", "flagged", or
+# "skipped" (verdict unavailable: not evidence either way, never cut).
+_VerifyBucket = str
+
+
 async def _verify(
     claim: Claim, candidates: list[Source], judge: Judge, confidence_min: float
-) -> GroundedClaim:
+) -> tuple[_VerifyBucket, GroundedClaim]:
     if not candidates:
-        return GroundedClaim(
+        return "flagged", GroundedClaim(
             claim=claim, grounded=False, sources=[], reason="No candidate sources in repo or KB."
         )
     evidence = "\n".join(f"({s.origin}:{s.ref}) {s.excerpt}" for s in candidates)
     verdict = await judge.verify_claim(claim=claim.text, evidence=evidence)
     if not verdict.available:
-        return GroundedClaim(claim=claim, grounded=False, sources=[], reason="Judgment skipped.")
+        return "skipped", GroundedClaim(
+            claim=claim, grounded=False, sources=[], reason="Judgment skipped."
+        )
     if verdict.relation == "contradicts":
-        return GroundedClaim(
+        return "flagged", GroundedClaim(
             claim=claim,
             grounded=False,
             sources=candidates,
             reason=f"Contradicted by the evidence (confidence {verdict.confidence:.2f}).",
         )
     if verdict.relation == "supports" and verdict.confidence >= confidence_min:
-        return GroundedClaim(claim=claim, grounded=True, sources=candidates, reason="")
-    return GroundedClaim(
+        return "grounded", GroundedClaim(claim=claim, grounded=True, sources=candidates, reason="")
+    return "flagged", GroundedClaim(
         claim=claim,
         grounded=False,
         sources=[],
@@ -222,7 +241,8 @@ async def ground_claims(
             ``ref`` and ``excerpt``. Fetch once via ``github_tools`` and reuse.
         cut_unsourced: When True, delete flagged (unsourced) claim sentences
             from the returned text. When False, the text is untouched and the
-            claims are only flagged.
+            claims are only flagged. Skipped claims (verdict unavailable) are
+            never cut, regardless of this flag.
         confidence_min: Minimum confidence for a "supports" verdict to count
             as grounded.
 
@@ -251,11 +271,19 @@ async def ground_claims(
     repo_sources = _repo_facts_to_sources(repo_facts)
     grounded: list[GroundedClaim] = []
     flagged: list[GroundedClaim] = []
+    skipped: list[GroundedClaim] = []
     for claim in claims:
         candidates = _kb_candidates(claim, kb) + repo_sources
-        gc = await _verify(claim, candidates, judge, confidence_min)
-        (grounded if gc.grounded else flagged).append(gc)
+        bucket, gc = await _verify(claim, candidates, judge, confidence_min)
+        if bucket == "grounded":
+            grounded.append(gc)
+        elif bucket == "skipped":
+            skipped.append(gc)
+        else:
+            flagged.append(gc)
 
+    # cut_unsourced only ever touches `flagged`; a skipped claim is not
+    # evidence the claim is wrong, so it is never a candidate for deletion.
     cut_applied = False
     text_after = text
     if cut_unsourced and flagged:
@@ -268,6 +296,7 @@ async def ground_claims(
             "total": len(claims),
             "grounded": len(grounded),
             "flagged": len(flagged),
+            "skipped": len(skipped),
             "cut_applied": cut_applied,
             "backend": judge.backend,
         },
@@ -280,4 +309,5 @@ async def ground_claims(
         cut_applied=cut_applied,
         text_after=text_after,
         judged=True,
+        skipped=skipped,
     )

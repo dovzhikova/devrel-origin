@@ -106,3 +106,47 @@ def test_render_pr_summary_pass_badge():
     )
     md = render_pr_summary(prov)
     assert "Grounding: PASS" in md
+
+
+def test_grounded_ok_false_and_skipped_badge_when_not_judged():
+    # judged=False means the stage never ran (no backend). A skip must never
+    # render as a pass, even when flagged_count happens to be 0.
+    grounding = {**_GROUNDING, "flagged_count": 0, "flagged": [], "judged": False}
+    prov = build_provenance(content_type="hero", stages=_STAGES, grounding=grounding)
+    assert prov["grounded_ok"] is False
+    md = render_pr_summary(prov)
+    assert "Grounding: SKIPPED" in md
+    assert "PASS" not in md
+
+
+def test_grounded_ok_false_and_partial_badge_when_claims_skipped():
+    # judged=True (the stage ran) but some individual claims were not judged
+    # (a transient per-call backend failure). Still not a pass.
+    grounding = {
+        **_GROUNDING,
+        "flagged_count": 0,
+        "flagged": [],
+        "judged": True,
+        "skipped_count": 1,
+    }
+    prov = build_provenance(content_type="hero", stages=_STAGES, grounding=grounding)
+    assert prov["grounded_ok"] is False
+    md = render_pr_summary(prov)
+    assert "PARTIAL" in md
+    assert "Grounding: PASS" not in md
+
+
+def test_render_pr_summary_pass_badge_fully_judged_zero_flags_zero_skips():
+    # Regression guard: a fully judged, clean result still renders PASS once
+    # `judged` and `skipped_count` are present and clean.
+    grounding = {
+        **_GROUNDING,
+        "flagged_count": 0,
+        "flagged": [],
+        "judged": True,
+        "skipped_count": 0,
+    }
+    prov = build_provenance(content_type="hero", stages=_STAGES, grounding=grounding)
+    assert prov["grounded_ok"] is True
+    md = render_pr_summary(prov)
+    assert "Grounding: PASS" in md
