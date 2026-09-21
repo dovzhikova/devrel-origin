@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-QUESTION_VERSION = 2
+QUESTION_VERSION = 3
 
 PATTERN_NONE = "none"
 
@@ -102,3 +102,13 @@ PATTERN = ChoiceSpec(
         ),
     },
 )
+
+# One Noul per pattern (all but PATTERN_NONE): a unit can exhibit more than one
+# pattern, and a single Choice over all patterns splits probability across
+# neighbours and misses at the threshold. Asking each pattern independently
+# does not.
+PATTERN_NOULS: dict[str, NoulSpec] = {
+    key: NoulSpec(instructions=f"Does `unit` exhibit this writing pattern? {definition}")
+    for key, definition in PATTERN.criteria.items()
+    if key != PATTERN_NONE
+}

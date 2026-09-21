@@ -23,7 +23,20 @@ def test_binary_contrast_excludes_informative_contrast():
     definition = q.PATTERN.criteria["binary_contrast"]
     assert "straw man" in definition
     assert "Not this pattern" in definition
-    assert q.QUESTION_VERSION == 2
+
+
+def test_question_version_is_3_for_per_pattern_nouls():
+    assert q.QUESTION_VERSION == 3
+
+
+def test_pattern_nouls_covers_every_pattern_except_none():
+    assert set(q.PATTERN_NOULS) == set(q.PATTERN.criteria) - {q.PATTERN_NONE}
+
+
+def test_pattern_nouls_instructions_ask_about_unit_and_keep_the_definition():
+    for key, spec in q.PATTERN_NOULS.items():
+        definition = q.PATTERN.criteria[key]
+        assert spec.instructions == f"Does `unit` exhibit this writing pattern? {definition}"
 
 
 def test_questions_module_does_not_import_the_optional_sdk():
