@@ -36,6 +36,15 @@ class TypeSafeJudge:
         self._api_key = api_key
         self._client = client
         self._chunk = max(1, max_questions_per_request)
+        self._reset_usage()
+
+    def _reset_usage(self) -> None:
+        """`last_usage` covers one public call, summed across its chunked requests.
+
+        Each public method resets this at its start; `_ask` adds into it, never
+        overwrites it. It is not a lifetime total: a caller reads it after every
+        public call to emit to a cost sink, and a running total would double count.
+        """
         self.last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
     def _open(self):
@@ -54,13 +63,12 @@ class TypeSafeJudge:
             resp = await client.system_one(state=state, questions=questions)
         usage = getattr(resp, "usage", None)
         if usage is not None:
-            self.last_usage = {
-                "input_tokens": getattr(usage, "input_tokens", 0) or 0,
-                "output_tokens": getattr(usage, "output_tokens", 0) or 0,
-            }
+            self.last_usage["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
+            self.last_usage["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
         return resp
 
     async def verify_claim(self, *, claim: str, evidence: str) -> ClaimVerdict:
+        self._reset_usage()
         try:
             resp = await self._ask(
                 {"claim": claim, "evidence": evidence},
@@ -81,6 +89,7 @@ class TypeSafeJudge:
 
     async def select_claims(self, *, sentences: list[str]) -> list[float]:
         """One `is_factual_claim` Noul per sentence, batched into one request."""
+        self._reset_usage()
         from typesafe_sdk import Noul
 
         out: list[float] = []
@@ -101,6 +110,7 @@ class TypeSafeJudge:
         return out
 
     async def judge_patterns(self, *, units: list[str], voice: str) -> list[PatternVerdict]:
+        self._reset_usage()
         from typesafe_sdk import Choice
 
         out: list[PatternVerdict] = []
