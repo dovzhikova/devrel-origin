@@ -82,11 +82,12 @@ geo-google = [
     "google-search-results>=2.4.2",
 ]
 
-# Typed judgments (TypeSafe System One). The anti-slop backend (judge_patterns)
-# is implemented but not wired into the pipeline; grounding is the only
-# consumer today. Without this extra (or without TYPESAFE_API_KEY), grounding
-# falls back to Haiku when an LLM client is available, otherwise it does not
-# run and reports itself unjudged.
+# Typed judgments (TypeSafe System One). Two stages consume it: grounding
+# (claim selection + verification) and the anti-slop stage (judge_patterns).
+# Without this extra (or without TYPESAFE_API_KEY): grounding falls back to
+# Haiku when an LLM client is available, otherwise it does not run and
+# reports itself unjudged; anti-slop falls back to the regex blocklist plus
+# llm_lint, unchanged from before typed judgments existed.
 typesafe = [
     "typesafe-sdk>=0.7.0,<0.8.0",
 ]

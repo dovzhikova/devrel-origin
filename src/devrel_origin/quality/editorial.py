@@ -393,8 +393,17 @@ async def _grounding_stage(
         confidence_min=confidence_min,
     )
     if not gr.judged:
-        # Not a pass. There is no deterministic equivalent of grounding, so
-        # without a backend the stage reports that it did not run.
+        # Not a pass. `backend == "none"` means no backend ever ran (no typed
+        # judge, no llm_client): the stage never attempted anything. Any
+        # other backend name means one DID run and still failed (an
+        # unparseable Haiku reply, or a typed selector failure with nothing
+        # to fall back to); naming it distinguishes "nothing to ask" from
+        # "asked and got nothing usable back."
+        detail = (
+            "skipped: no judgment backend"
+            if gr.backend == "none"
+            else f"not judged (backend={gr.backend})"
+        )
         return (
             text,
             StageResult(
@@ -402,7 +411,7 @@ async def _grounding_stage(
                 text_before=text,
                 text_after=text,
                 duration_s=round(time.monotonic() - t0, 3),
-                detail="skipped: no judgment backend",
+                detail=detail,
             ),
             gr,
         )

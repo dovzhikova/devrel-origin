@@ -243,3 +243,50 @@ async def test_no_state_db_completes_and_writes_nothing(tmp_path, monkeypatch):
 
     assert result.provenance["grounding_ran"] is True
     assert not paths.state_db.exists()
+
+
+@pytest.mark.asyncio
+async def test_grounding_stage_detail_names_the_failed_backend(tmp_path):
+    # FINAL RE-REVIEW part A, Minor: a backend that ran and failed (Haiku's
+    # extraction reply could not be parsed) is a different situation than no
+    # backend existing at all, and the stage detail must say so by name
+    # rather than the generic "skipped: no judgment backend".
+    from devrel_origin.quality.judgments import NullJudge
+
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.generate = AsyncMock(return_value="not valid json at all")
+
+    _text, sr, gr = await editorial._grounding_stage(
+        text="x",
+        project_paths=paths,
+        judge=NullJudge(),
+        llm_client=client,
+        repo_facts=None,
+        cut_unsourced=False,
+    )
+    assert gr.judged is False
+    assert gr.backend == "haiku"
+    assert sr.detail == "not judged (backend=haiku)"
+    assert "skipped" not in sr.detail
+
+
+@pytest.mark.asyncio
+async def test_grounding_stage_detail_when_truly_no_backend_ran(tmp_path):
+    # No typed judge and no llm_client at all: no backend ever ran, so the
+    # generic message is accurate here (distinct from the case above).
+    from devrel_origin.quality.judgments import NullJudge
+
+    paths = _project(tmp_path)
+
+    _text, sr, gr = await editorial._grounding_stage(
+        text="x",
+        project_paths=paths,
+        judge=NullJudge(),
+        llm_client=None,
+        repo_facts=None,
+        cut_unsourced=False,
+    )
+    assert gr.judged is False
+    assert gr.backend == "none"
+    assert sr.detail == "skipped: no judgment backend"
