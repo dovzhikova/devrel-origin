@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 
-from devrel_origin.project.cost_sink import _compute_cost_usd, make_sqlite_sink
+from devrel_origin.project.cost_sink import _compute_cost_usd, is_priced, make_sqlite_sink
 from devrel_origin.project.state import init_db
 
 
@@ -26,6 +26,14 @@ def test_compute_cost_usd_sonnet():
 
 def test_compute_cost_usd_unknown_model_returns_zero():
     assert _compute_cost_usd("not-a-real-model", {"input_tokens": 1000}) == 0.0
+
+
+def test_is_priced_known_model():
+    assert is_priced("claude-sonnet-4-5-20250929") is True
+
+
+def test_is_priced_unknown_model():
+    assert is_priced("typesafe:jev") is False
 
 
 def test_compute_cost_usd_includes_cache_tokens():
