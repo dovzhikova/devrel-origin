@@ -112,3 +112,27 @@ PATTERN_NOULS: dict[str, NoulSpec] = {
     for key, definition in PATTERN.criteria.items()
     if key != PATTERN_NONE
 }
+
+# Per-pattern hit thresholds. Fitted 2026-09-21 on two calibration corpora
+# (rematch + rematch3, 39 pooled human gold-none units, 78 observations at
+# 2 runs/unit). Rule: lowest t in 0.30..0.95 (step 0.05) at which the pattern
+# flags <= 2.5% of the pooled gold-none units; 1.01 (disabled) if none
+# qualified. Source of truth:
+# evidence-verify-typesafe/calibration/thresholds.json, sha256 prefix
+# 3b4ba9b2. Known cost at these thresholds: about 10-26% false flags on
+# human technical writing and about 30% on clean generated text (recall
+# about 81%); the previous llm_lint flagged about 75%. Shipped by owner
+# override after a failed held-out test. Never describe this gate as
+# having passed; see task-6d-brief.md.
+PATTERN_THRESHOLDS: dict[str, float] = {
+    "binary_contrast": 0.30,
+    "throat_clearing": 0.50,
+    "faux_insight": 0.30,
+    "colon_reveal": 0.45,
+    "importance_puffery": 0.90,
+    "weasel_attribution": 0.65,
+    "metadiscourse": 0.55,
+    "fake_profound_kicker": 0.75,
+    "summary_recap": 0.75,
+    "superficial_analysis": 0.75,
+}
