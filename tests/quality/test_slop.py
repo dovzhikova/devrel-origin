@@ -70,6 +70,73 @@ def test_find_slop_empty_when_no_matches():
     assert find_slop("Direct, sharp, no fluff.", ["delve", "tapestry"]) == []
 
 
+def test_the_shipped_template_contains_no_prose_entries():
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
+        encoding="utf-8"
+    )
+    entries = parse_blocklist(md)
+    assert entries, "template parsed to nothing"
+    long_entries = [e for e in entries if len(e.split()) > 6]
+    assert long_entries == [], f"prose ingested as blocklist entries: {long_entries}"
+
+
+def test_very_and_really_stay_in_tier_one_since_tier_two_was_never_built():
+    # Tier 2 (context-dependent intensifiers judged, not matched) was never
+    # built, so removing these would weaken the gate rather than sharpen it.
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
+        encoding="utf-8"
+    )
+    entries = set(parse_blocklist(md))
+    assert {"very", "really"} <= entries
+
+
+def test_tier_one_additions_from_no_ai_slop_are_present():
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
+        encoding="utf-8"
+    )
+    entries = set(parse_blocklist(md))
+    added = {
+        "foster",
+        "leverage",
+        "utilize",
+        "facilitate",
+        "streamline",
+        "robust",
+        "cutting-edge",
+        "paradigm shift",
+        "game changer",
+        "realm",
+        "beacon",
+        "multifaceted",
+        "meticulous",
+        "intricate",
+        "paramount",
+        "transformative",
+        "elevate",
+        "embark",
+        "supercharge",
+        "harness",
+        "ever-evolving",
+    }
+    assert added <= entries
+
+
+def test_mit_credit_line_present():
+    from pathlib import Path
+
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
+        encoding="utf-8"
+    )
+    assert "petergyang/no-ai-slop" in md
+    assert "MIT" in md
+
+
 @pytest.mark.asyncio
 async def test_llm_lint_calls_haiku_and_parses_phrases():
     client = MagicMock()
