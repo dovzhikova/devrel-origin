@@ -62,7 +62,13 @@ class NullJudge:
     backend = "none"
 
     async def select_claims(self, *, sentences: list[str]) -> list[float] | None:
-        return [0.0 for _ in sentences]
+        # None, matching the protocol's failure contract (`verify_claim`'s
+        # `available=False`, `judge_patterns`' per-unit `available=False`):
+        # NullJudge never asked, so a padded 0.0 per sentence would be
+        # indistinguishable from a real "not a claim" determination. Callers
+        # are already gated on `judge.available` before reaching this, so
+        # this is a contract fix, not a behavior change for any real caller.
+        return None
 
     async def verify_claim(self, *, claim: str, evidence: str) -> ClaimVerdict:
         return ClaimVerdict(

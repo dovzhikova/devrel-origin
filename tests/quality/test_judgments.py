@@ -55,9 +55,13 @@ def test_pattern_verdict_probabilities_carries_every_pattern_when_given():
 
 
 @pytest.mark.asyncio
-async def test_null_judge_selects_no_claims():
-    # Zero, not one: an unjudged sentence must not enter the grounding loop.
-    assert await NullJudge().select_claims(sentences=["a.", "b."]) == [0.0, 0.0]
+async def test_null_judge_select_claims_is_unavailable_not_a_zero_verdict():
+    # None, not a list of zeros: NullJudge never asked, so it must return
+    # the protocol's explicit "no judgment made" signal, matching
+    # verify_claim's `available=False` and judge_patterns' `available=False`
+    # per unit. A padded 0.0 would be indistinguishable from a real "not a
+    # claim" determination.
+    assert await NullJudge().select_claims(sentences=["a.", "b."]) is None
 
 
 def test_build_judge_falls_back_without_a_key(monkeypatch):
