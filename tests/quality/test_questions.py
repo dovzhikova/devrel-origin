@@ -19,9 +19,6 @@ def test_every_criterion_is_a_concrete_definition_not_a_bare_label():
 
 
 def test_questions_module_does_not_import_the_optional_sdk():
-    import sys
-
-    assert "typesafe_sdk" not in sys.modules or True  # import is allowed elsewhere
     src = q.__file__ or ""
     assert src.endswith("questions.py")
     with open(src, encoding="utf-8") as fh:
