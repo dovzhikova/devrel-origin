@@ -16,12 +16,16 @@ from devrel_origin.quality.editorial import (
 from devrel_origin.quality.judgments import PatternVerdict
 from devrel_origin.quality.questions import PATTERN_NONE
 
+UNAVAILABLE = "__unavailable__"  # sentinel: this unit's verdict comes back unavailable
+
 
 class _ScriptedPatternJudge:
     """A judge whose `judge_patterns` answers change between calls, so a test
     can script "flagged on the first check, clean on the re-check after
     rewrite" the way a real judge's answer would change once the rewrite
-    removed the pattern."""
+    removed the pattern. A spec entry of `(UNAVAILABLE, 0.0)` scripts that
+    unit's verdict as unavailable (a per-unit judgment failure), distinct
+    from an absent entry, which scripts an available "no pattern" verdict."""
 
     available = True
     backend = "fake"
@@ -37,6 +41,17 @@ class _ScriptedPatternJudge:
         for i, _ in enumerate(units):
             if i in spec:
                 pattern, prob = spec[i]
+                if pattern == UNAVAILABLE:
+                    out.append(
+                        PatternVerdict(
+                            unit_index=i,
+                            pattern=PATTERN_NONE,
+                            confidence=0.0,
+                            available=False,
+                            backend=self.backend,
+                        )
+                    )
+                    continue
                 out.append(
                     PatternVerdict(
                         unit_index=i,
@@ -294,6 +309,84 @@ async def test_typed_judge_pattern_persists_after_rewrite_aborts_loud(tmp_path, 
             initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
         )
     assert "faux_insight" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_all_units_unavailable_falls_back_to_llm_lint(tmp_path, monkeypatch):
+    # judge_patterns fails outright for every unit (a total backend failure,
+    # the kind caught inside judgments_typesafe.py). This must never read as
+    # "clean" just because find_patterns saw no hits; the stage must fall
+    # back to the llm_lint path, exactly as when no judge is available at
+    # all, and name llm_lint as what ran.
+    judge = _ScriptedPatternJudge(responses=[{0: (UNAVAILABLE, 0.0)}])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.set_agent = MagicMock()
+    client.generate_with_revision = AsyncMock(
+        return_value=(
+            "Clean text, no blocklist hits.",
+            MagicMock(final_score=8, revision_rounds=0, critiques=[]),
+        )
+    )
+    lint_called = False
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        nonlocal lint_called
+        if "screening AI-written content" in system_prompt:  # llm_lint
+            lint_called = True
+            return ""
+        if "skeptical senior backend developer" in system_prompt:  # persona
+            return '{"score": 8, "weak_sections": [], "feedback": "ok"}'
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    result = await run_pipeline(
+        initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+    )
+    slop_stage = next(s for s in result.stages if s.name == "anti_slop")
+    assert lint_called, "a total judge failure must fall back to the llm_lint path"
+    assert "llm_lint" in slop_stage.detail
+    assert "clean" in slop_stage.detail
+
+
+@pytest.mark.asyncio
+async def test_typed_judge_partial_unavailable_never_reports_clean(tmp_path, monkeypatch):
+    # Unit 0 comes back unavailable; unit 1 is judged clean (no pattern hit).
+    # No real hit exists, so this must never render "clean" the way a fully
+    # judged clean run does: the unjudged unit is not evidence of anything.
+    judge = _ScriptedPatternJudge(responses=[{0: (UNAVAILABLE, 0.0)}])
+    monkeypatch.setattr(editorial, "build_judge", lambda: judge)
+    paths = _project(tmp_path)
+    client = MagicMock()
+    client.set_agent = MagicMock()
+    client.generate_with_revision = AsyncMock(
+        return_value=(
+            "First paragraph, unjudged.\n\nSecond paragraph, judged clean.",
+            MagicMock(final_score=8, revision_rounds=0, critiques=[]),
+        )
+    )
+
+    async def _generate(*, system_prompt, user_prompt, model, **kwargs):
+        if "skeptical senior backend developer" in system_prompt:  # persona
+            return '{"score": 8, "weak_sections": [], "feedback": "ok"}'
+        return ""
+
+    client.generate = AsyncMock(side_effect=_generate)
+
+    result = await run_pipeline(
+        initial_draft="x", content_type="tutorial", project_paths=paths, llm_client=client
+    )
+    slop_stage = next(s for s in result.stages if s.name == "anti_slop")
+    assert slop_stage.detail != "clean"
+    assert "clean" not in slop_stage.detail
+    assert "1 of 2 units not judged" in slop_stage.detail
+    assert any(i.startswith("Not judged: ") for i in slop_stage.issues)
+    assert any("First paragraph, unjudged." in i for i in slop_stage.issues)
+    # No real hit anywhere, so the unjudged unit alone must not trigger a
+    # rewrite: the text is untouched.
+    assert slop_stage.text_after == slop_stage.text_before
 
 
 @pytest.mark.asyncio

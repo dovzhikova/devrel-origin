@@ -36,6 +36,8 @@ from devrel_origin.quality.provenance import build_provenance
 from devrel_origin.quality.questions import PATTERN_THRESHOLDS
 from devrel_origin.quality.readability import check_against_target, compute_readability
 from devrel_origin.quality.slop import (
+    PatternHit,
+    SlopHit,
     find_patterns,
     find_slop,
     force_rewrite,
@@ -162,46 +164,151 @@ async def _slop_stage(
     per-pattern path (calibrated thresholds, quoted passages). Without one,
     it falls back to the llm_lint path exactly as it behaved before the
     typed judge existed, so a project without the extra sees no regression.
+
+    A judgment call can also fail once a judge is available: `judge_patterns`
+    catches its own request errors and returns `available=False` verdicts for
+    the affected units (see `judgments_typesafe.py`), which is silent by
+    design at that layer. This stage treats that as a third state, distinct
+    from "clean" and from "hit," mirroring the grounding stage's "not judged":
+
+    - Every unit unavailable is a total typed-judge failure. That is not
+      "zero patterns found"; the stage falls back to the llm_lint path
+      exactly as when no judge is available, and `detail` names `llm_lint`
+      as what ran.
+    - Some units unavailable, none of the judged units flag a real hit: the
+      stage never reports "clean" (an unjudged unit is not evidence of
+      anything). `detail` states how many units were not judged, and each
+      appears in `issues` as `"Not judged: <passage>"`. It also never
+      triggers a rewrite on its own: only a real hit (regex or a pattern
+      that cleared its threshold) does that. The same rule applies to the
+      post-rewrite recheck.
     """
     t0 = time.monotonic()
-    use_typed = judge.available
 
-    async def _check(text: str):
+    async def _llm_check(text: str) -> tuple[list[SlopHit], list[str]]:
+        return find_slop(text, blocklist), await llm_lint(text, voice, llm_client)
+
+    async def _typed_check(
+        text: str,
+    ) -> tuple[list[SlopHit], list[PatternHit], list[int], list[str]]:
         regex_hits = find_slop(text, blocklist)
-        if use_typed:
-            verdicts = await judge.judge_patterns(units=split_units(text), voice=voice)
-            return regex_hits, find_patterns(text, verdicts, PATTERN_THRESHOLDS)
-        return regex_hits, await llm_lint(text, voice, llm_client)
+        units = split_units(text)
+        verdicts = await judge.judge_patterns(units=units, voice=voice)
+        pattern_hits = find_patterns(text, verdicts, PATTERN_THRESHOLDS)
+        unjudged = sorted(v.unit_index for v in verdicts if not v.available)
+        return regex_hits, pattern_hits, unjudged, units
 
-    regex_hits, slop_hits = await _check(text_before)
-    if not regex_hits and not slop_hits:
-        detail = f"clean (judged_by={judge.backend})" if use_typed else "clean"
+    def _all_unjudged(unjudged: list[int], units: list[str]) -> bool:
+        return bool(units) and len(unjudged) == len(units)
+
+    def _unjudged_issues(unjudged: list[int], units: list[str]) -> list[str]:
+        return [f"Not judged: {units[i][:60]}" for i in unjudged]
+
+    async def _llm_lint_stage(reason: str | None) -> tuple[str, StageResult]:
+        """The whole stage on the llm_lint path. `reason` is appended to
+        `detail` (e.g. "llm_lint" when a typed judge failed outright);
+        `None` reproduces the exact plain "clean"/"rewrite_applied" strings
+        from before the typed judge existed, for the no-judge-at-all case."""
+        regex_hits, lint_hits = await _llm_check(text_before)
+        suffix = f" ({reason})" if reason else ""
+        if not regex_hits and not lint_hits:
+            return text_before, StageResult(
+                name="anti_slop",
+                text_before=text_before,
+                text_after=text_before,
+                duration_s=round(time.monotonic() - t0, 3),
+                detail=f"clean{suffix}",
+            )
+        rewritten = await force_rewrite(text_before, regex_hits, lint_hits, voice, llm_client)
+        re_regex, re_lint = await _llm_check(rewritten)
+        if re_regex or re_lint:
+            offenders = sorted({h.phrase for h in re_regex} | set(re_lint))
+            raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
+        return rewritten, StageResult(
+            name="anti_slop",
+            text_before=text_before,
+            text_after=rewritten,
+            duration_s=round(time.monotonic() - t0, 3),
+            issues=sorted({h.phrase for h in regex_hits} | set(lint_hits)),
+            detail=f"rewrite_applied{suffix}",
+        )
+
+    if not judge.available:
+        return await _llm_lint_stage(None)
+
+    regex_hits, pattern_hits, unjudged, units = await _typed_check(text_before)
+    if _all_unjudged(unjudged, units):
+        logger.warning(
+            "slop_typed_judge_failed_all_units",
+            extra={"backend": judge.backend, "unit_count": len(units)},
+        )
+        return await _llm_lint_stage("llm_lint")
+
+    if not regex_hits and not pattern_hits:
+        if unjudged:
+            return text_before, StageResult(
+                name="anti_slop",
+                text_before=text_before,
+                text_after=text_before,
+                duration_s=round(time.monotonic() - t0, 3),
+                issues=_unjudged_issues(unjudged, units),
+                detail=(
+                    f"{len(unjudged)} of {len(units)} units not judged (judged_by={judge.backend})"
+                ),
+            )
         return text_before, StageResult(
             name="anti_slop",
             text_before=text_before,
             text_after=text_before,
             duration_s=round(time.monotonic() - t0, 3),
-            detail=detail,
+            detail=f"clean (judged_by={judge.backend})",
         )
 
-    rewritten = await force_rewrite(text_before, regex_hits, slop_hits, voice, llm_client)
-    # Re-check after rewrite.
-    re_regex, re_slop = await _check(rewritten)
-    if re_regex or re_slop:
-        if use_typed:
-            offenders = sorted({h.phrase for h in re_regex} | {h.pattern for h in re_slop})
-        else:
-            offenders = sorted({h.phrase for h in re_regex} | set(re_slop))
+    rewritten = await force_rewrite(text_before, regex_hits, pattern_hits, voice, llm_client)
+    re_regex, re_pattern_hits, re_unjudged, re_units = await _typed_check(rewritten)
+
+    if _all_unjudged(re_unjudged, re_units):
+        # The recheck itself cannot be verified via the typed judge; fall
+        # back to llm_lint for this one check rather than silently trusting
+        # the rewrite is clean.
+        logger.warning(
+            "slop_typed_judge_failed_all_units_on_recheck",
+            extra={"backend": judge.backend, "unit_count": len(re_units)},
+        )
+        llm_re_regex, llm_re_lint = await _llm_check(rewritten)
+        if llm_re_regex or llm_re_lint:
+            offenders = sorted({h.phrase for h in llm_re_regex} | set(llm_re_lint))
+            raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
+        issues = sorted({h.phrase for h in regex_hits}) + [
+            f"{h.pattern}: {h.unit_text[:60]}" for h in pattern_hits
+        ]
+        return rewritten, StageResult(
+            name="anti_slop",
+            text_before=text_before,
+            text_after=rewritten,
+            duration_s=round(time.monotonic() - t0, 3),
+            issues=issues,
+            detail=(
+                f"rewrite_applied (judged_by={judge.backend}, "
+                "recheck via llm_lint after judge failure)"
+            ),
+        )
+
+    if re_regex or re_pattern_hits:
+        offenders = sorted({h.phrase for h in re_regex} | {h.pattern for h in re_pattern_hits})
         raise AbortLoud("Slop persisted after rewrite: " + ", ".join(offenders))
 
-    if use_typed:
-        issues = sorted({h.phrase for h in regex_hits}) + [
-            f"{h.pattern}: {h.unit_text[:60]}" for h in slop_hits
-        ]
-        detail = f"rewrite_applied (judged_by={judge.backend})"
+    issues = sorted({h.phrase for h in regex_hits}) + [
+        f"{h.pattern}: {h.unit_text[:60]}" for h in pattern_hits
+    ]
+    if re_unjudged:
+        issues += _unjudged_issues(re_unjudged, re_units)
+        detail = (
+            f"rewrite_applied (judged_by={judge.backend}, "
+            f"{len(re_unjudged)} of {len(re_units)} units not judged on recheck)"
+        )
     else:
-        issues = sorted({h.phrase for h in regex_hits} | set(slop_hits))
-        detail = "rewrite_applied"
+        detail = f"rewrite_applied (judged_by={judge.backend})"
 
     return rewritten, StageResult(
         name="anti_slop",

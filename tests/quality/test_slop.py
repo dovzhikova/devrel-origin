@@ -262,7 +262,12 @@ def test_find_patterns_names_the_highest_probability_pattern_that_cleared():
     assert hits[0].confidence == 0.75
 
 
-def test_find_patterns_an_unavailable_verdict_is_never_a_hit_and_never_a_pass():
+def test_find_patterns_an_unavailable_verdict_is_never_a_hit():
+    # This proves find_patterns's own contract only: a unit whose verdict is
+    # unavailable never becomes a PatternHit. It says nothing about whether a
+    # stage built on top of this ever reports "clean" when unavailable
+    # verdicts are present — that is _slop_stage's job, covered separately in
+    # tests/quality/test_editorial.py.
     verdicts = [
         PatternVerdict(
             unit_index=0, pattern="none", confidence=0.0, available=False, backend="none"
