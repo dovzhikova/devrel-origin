@@ -73,9 +73,7 @@ def test_find_slop_empty_when_no_matches():
 def test_the_shipped_template_contains_no_prose_entries():
     from pathlib import Path
 
-    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
-        encoding="utf-8"
-    )
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
     entries = parse_blocklist(md)
     assert entries, "template parsed to nothing"
     long_entries = [e for e in entries if len(e.split()) > 6]
@@ -87,9 +85,7 @@ def test_very_and_really_stay_in_tier_one_since_tier_two_was_never_built():
     # built, so removing these would weaken the gate rather than sharpen it.
     from pathlib import Path
 
-    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
-        encoding="utf-8"
-    )
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
     entries = set(parse_blocklist(md))
     assert {"very", "really"} <= entries
 
@@ -97,9 +93,7 @@ def test_very_and_really_stay_in_tier_one_since_tier_two_was_never_built():
 def test_tier_one_additions_from_no_ai_slop_are_present():
     from pathlib import Path
 
-    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
-        encoding="utf-8"
-    )
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
     entries = set(parse_blocklist(md))
     added = {
         "foster",
@@ -130,9 +124,7 @@ def test_tier_one_additions_from_no_ai_slop_are_present():
 def test_mit_credit_line_present():
     from pathlib import Path
 
-    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(
-        encoding="utf-8"
-    )
+    md = Path("src/devrel_origin/project/templates/slop-blocklist.md").read_text(encoding="utf-8")
     assert "petergyang/no-ai-slop" in md
     assert "MIT" in md
 
