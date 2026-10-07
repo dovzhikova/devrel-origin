@@ -28,9 +28,9 @@ The wizard:
 
 1. **Scaffolds `.devrel/`** with `config.toml`, `voice.md`, `style.md`,
    `slop-blocklist.md`, `kb/`, `deliverables/`, `state.db`
-2. **Configures an LLM key** — pick Anthropic or OpenRouter (recommended:
-   free credits, no waitlist), validates with a one-token ping, writes to
-   `.devrel/.env` (chmod 600)
+2. **Configures an LLM key**: pick Anthropic (the default, Claude Sonnet 4.6)
+   or OpenRouter (free monthly credits), validates with a one-token ping,
+   writes to `.devrel/.env` (chmod 600)
 3. **Runs a health check** — confirms env, scaffold, schema
 4. **Opens `voice.md` in `$EDITOR`** so you can drop in 3-5 sample passages
    from your best published content
@@ -54,9 +54,10 @@ devrel run                       # ad-hoc weekly pipeline (all 15 agents)
 devrel schedule install          # cron it (Mondays 09:00 UTC default)
 ```
 
-> **Why OpenRouter?** Lower onboarding barrier than Anthropic API access (no
-> waitlist, free monthly credits) and supports per-agent model routing.
-> The wizard recommends it.
+> **Anthropic or OpenRouter?** The Anthropic API is the default and the
+> provider Origin is built and tested against (Claude Sonnet 4.6, Haiku for
+> the cheap stages). Pick OpenRouter when you want its free monthly credits
+> or per-agent routing to non-Claude models.
 
 Stuck? See [docs/troubleshooting.md](docs/troubleshooting.md) for the
 common failures (OpenRouter 400, missing keys, ungrounded content,
