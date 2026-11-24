@@ -1,7 +1,8 @@
 # devrel-origin
 
-**A developer-first CLI for AI-powered DevRel, sales, and marketing.**
-**Website:** [useorigin.co](https://useorigin.co)
+Turn repository changes into a draft your team can review in Git. Origin writes the draft and its source trace under `.devrel/deliverables/`. You choose which files to commit and open the pull request.
+
+[Inspect the PostHog session replay tutorial and its validation record](https://useorigin.co/docs/examples#posthog-session-replay-nextjs) · [Follow the quickstart](https://useorigin.co/quickstart)
 
 `devrel-origin` is a `pipx`-installable command-line tool that runs a 15-agent system against any project — community triage, social listening, theme extraction, growth experiments, content production, video tutorials, documentation, competitive intel, sales outreach, brand-consistent campaigns, and post-publish content performance analysis. Operates on a project repo the way `git`, `npm`, and `cargo` do.
 
@@ -13,9 +14,7 @@ Every piece of content the system produces flows through an 8-stage editorial pi
 
 ## Quick start
 
-First content in five minutes. `devrel init` is now an interactive wizard
-that walks you through scaffold → LLM key → health check → voice tuning →
-first draft in one session.
+Use Python 3.12 or newer and pipx. Have an Anthropic or OpenRouter API key ready to generate a draft. The wizard creates the project files, checks the provider, opens your voice settings, and prompts for a topic.
 
 ```bash
 pipx install devrel-origin
